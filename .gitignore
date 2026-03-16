@@ -12,4 +12,6 @@ env/
 
 # Local data outputs
 sample_data/unpacked/
+sample_data/beat*/
+sample_data/chart*/
 
