@@ -5,6 +5,12 @@ from .data import (
     load_one_sample,
     build_vocab_from_all_splits,
     encode_tokens,
+    infer_difficulty_value,
+    infer_density_nps,
+    infer_beatmap_id_value,
+    preprocess_difficulty_value,
+    preprocess_density_nps,
+    preprocess_beatmap_id,
     TaikoDataset,
     taiko_collate_fn,
 )
@@ -25,6 +31,7 @@ from .trainer import (
     plot_loss,
 )
 from .generation import (
+    SamplingConfig,
     TaikoBeatmapGenerator,
     compare_song_output_with_notes_json,
 )
@@ -36,6 +43,12 @@ __all__ = [
     "load_one_sample",
     "build_vocab_from_all_splits",
     "encode_tokens",
+    "infer_difficulty_value",
+    "infer_density_nps",
+    "infer_beatmap_id_value",
+    "preprocess_difficulty_value",
+    "preprocess_density_nps",
+    "preprocess_beatmap_id",
     "TaikoDataset",
     "taiko_collate_fn",
     "AudioEmbedding",
@@ -50,6 +63,7 @@ __all__ = [
     "validate_one_epoch",
     "fit",
     "plot_loss",
+    "SamplingConfig",
     "TaikoBeatmapGenerator",
     "compare_song_output_with_notes_json",
 ]

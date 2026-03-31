@@ -1,8 +1,15 @@
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 import json
 import math
 import torch
 
+from src.model.data import (
+    preprocess_beatmap_id,
+    preprocess_density_nps,
+    preprocess_difficulty_value,
+)
 from src.preprocessing.beat_aligned_dataset import (
     get_audio_info,
     compute_beat_grid_info,
@@ -13,13 +20,44 @@ from src.preprocessing.beat_aligned_dataset import (
 )
 
 
+@dataclass
+class SamplingConfig:
+    temperature: float = 0.9
+    top_p: float = 0.82
+    top_k: int = 4
+    ts_top_k: int = 2
+    min_event_candidates: int = 2
+    repetition_penalty: float = 1.0
+
+
 class TaikoBeatmapGenerator:
-    def __init__(self, model, token_to_id, id_to_token, device, max_len=64):
+    def __init__(self, model, token_to_id, id_to_token, device, max_len=64, audio_cache_size=8):
         self.model = model
         self.token_to_id = token_to_id
         self.id_to_token = id_to_token
         self.device = device
         self.max_len = max_len
+        self.audio_cache_size = max(1, int(audio_cache_size))
+        self._audio_cache = OrderedDict()
+
+        self.pad_id = token_to_id.get("PAD")
+        self.bos_id = token_to_id["BOS"]
+        self.eos_id = token_to_id["EOS"]
+
+        ts_ids = []
+        event_ids = []
+        for tid, tok in id_to_token.items():
+            if tok in {"PAD", "BOS"}:
+                continue
+            if tok.startswith("TS_"):
+                ts_ids.append(tid)
+            else:
+                event_ids.append(tid)
+
+        self.ts_token_ids = sorted(ts_ids)
+        self.event_token_ids = sorted(event_ids)
+        self.ts_token_ids_tensor = torch.tensor(self.ts_token_ids, dtype=torch.long, device=self.device)
+        self.event_token_ids_tensor = torch.tensor(self.event_token_ids, dtype=torch.long, device=self.device)
 
     def build_timing_info(self, audio_path, offset_ms, bpm, meter=4):
         audio_path = Path(audio_path)
@@ -40,42 +78,201 @@ class TaikoBeatmapGenerator:
             "beat_duration_ms": float(beat_duration_ms),
         }
 
-    @torch.no_grad()
-    def greedy_decode(self, audio):
-        self.model.eval()
+    def _cache_get_or_compute(self, cache_key, compute_fn):
+        if cache_key in self._audio_cache:
+            value = self._audio_cache.pop(cache_key)
+            self._audio_cache[cache_key] = value
+            return value
 
-        bos_id = self.token_to_id["BOS"]
-        eos_id = self.token_to_id["EOS"]
+        value = compute_fn()
+        self._audio_cache[cache_key] = value
+        if len(self._audio_cache) > self.audio_cache_size:
+            self._audio_cache.popitem(last=False)
+        return value
+
+    def _resolve_condition_values(self, difficulty=5.0, density_nps=6.0, beatmap_id=1_000_000):
+        difficulty_norm = preprocess_difficulty_value(difficulty)
+        density_norm = preprocess_density_nps(density_nps)
+        beatmap_id_norm = preprocess_beatmap_id(beatmap_id)
+
+        difficulty_values = torch.tensor([difficulty_norm], dtype=torch.float32, device=self.device)
+        density_values = torch.tensor([density_norm], dtype=torch.float32, device=self.device)
+        beatmap_id_values = torch.tensor([beatmap_id_norm], dtype=torch.float32, device=self.device)
+        return difficulty_values, density_values, beatmap_id_values
+
+    def _apply_repetition_penalty(self, logits, generated_ids, repetition_penalty):
+        if repetition_penalty is None or repetition_penalty <= 1.0 or generated_ids.numel() == 0:
+            return logits
+
+        adjusted = logits.clone()
+        unique_ids = torch.unique(generated_ids)
+        for token_id in unique_ids:
+            idx = int(token_id.item())
+            if adjusted[idx] < 0:
+                adjusted[idx] *= repetition_penalty
+            else:
+                adjusted[idx] /= repetition_penalty
+        return adjusted
+
+    def _class_aware_candidate_ids(self, logits_1d, top_k, ts_top_k, min_event_candidates):
+        if self.event_token_ids_tensor.numel() == 0:
+            return torch.arange(logits_1d.size(0), device=logits_1d.device)
+
+        event_k = max(int(min_event_candidates), min(int(top_k), int(self.event_token_ids_tensor.numel())))
+        if event_k <= 0:
+            event_k = min_event_candidates
+
+        event_scores = logits_1d.index_select(0, self.event_token_ids_tensor)
+        _, event_local_idx = torch.topk(event_scores, k=event_k)
+        event_ids = self.event_token_ids_tensor.index_select(0, event_local_idx)
+
+        if self.ts_token_ids_tensor.numel() > 0 and ts_top_k > 0:
+            ts_k = min(int(ts_top_k), int(self.ts_token_ids_tensor.numel()))
+            ts_scores = logits_1d.index_select(0, self.ts_token_ids_tensor)
+            _, ts_local_idx = torch.topk(ts_scores, k=ts_k)
+            ts_ids = self.ts_token_ids_tensor.index_select(0, ts_local_idx)
+            candidates = torch.cat([event_ids, ts_ids], dim=0)
+        else:
+            candidates = event_ids
+
+        if self.eos_id not in candidates.tolist():
+            candidates = torch.cat(
+                [candidates, torch.tensor([self.eos_id], dtype=torch.long, device=logits_1d.device)],
+                dim=0,
+            )
+
+        return torch.unique(candidates)
+
+    def _apply_top_p(self, probs_1d, token_ids, top_p):
+        top_p = float(max(0.05, min(1.0, top_p)))
+
+        sorted_probs, sorted_idx = torch.sort(probs_1d, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=0)
+        keep_sorted = cumulative <= top_p
+        keep_sorted[0] = True
+
+        kept_idx = sorted_idx[keep_sorted]
+        kept_ids = token_ids.index_select(0, kept_idx)
+        kept_probs = probs_1d.index_select(0, kept_idx)
+        kept_probs = kept_probs / kept_probs.sum()
+        return kept_ids, kept_probs
+
+    def _sample_next_token(self, logits_last, generated_ids, sampling_config):
+        temperature = float(sampling_config.temperature)
+        top_p = float(sampling_config.top_p)
+        top_k = int(max(1, sampling_config.top_k))
+        ts_top_k = int(max(0, sampling_config.ts_top_k))
+        min_event_candidates = int(max(1, sampling_config.min_event_candidates))
+
+        logits_1d = logits_last[0]
+        logits_1d = self._apply_repetition_penalty(
+            logits_1d,
+            generated_ids,
+            repetition_penalty=float(sampling_config.repetition_penalty),
+        )
+
+        if temperature <= 0.0:
+            next_id = torch.argmax(logits_1d).view(1, 1)
+            return next_id
+
+        scaled_logits = logits_1d / max(1e-6, temperature)
+        candidate_ids = self._class_aware_candidate_ids(
+            scaled_logits,
+            top_k=top_k,
+            ts_top_k=ts_top_k,
+            min_event_candidates=min_event_candidates,
+        )
+
+        candidate_logits = scaled_logits.index_select(0, candidate_ids)
+        candidate_probs = torch.softmax(candidate_logits, dim=0)
+
+        filtered_ids, filtered_probs = self._apply_top_p(candidate_probs, candidate_ids, top_p)
+
+        event_mask = torch.isin(filtered_ids, self.event_token_ids_tensor)
+        if event_mask.sum().item() < min_event_candidates:
+            event_candidates = self.event_token_ids_tensor
+            event_scores = scaled_logits.index_select(0, event_candidates)
+            _, extra_idx = torch.topk(
+                event_scores,
+                k=min(min_event_candidates, int(event_candidates.numel())),
+            )
+            extra_ids = event_candidates.index_select(0, extra_idx)
+
+            merged_ids = torch.unique(torch.cat([filtered_ids, extra_ids], dim=0))
+            merged_logits = scaled_logits.index_select(0, merged_ids)
+            merged_probs = torch.softmax(merged_logits, dim=0)
+            filtered_ids, filtered_probs = self._apply_top_p(merged_probs, merged_ids, top_p=1.0)
+
+        sampled_local = torch.multinomial(filtered_probs, num_samples=1)
+        next_id = filtered_ids.index_select(0, sampled_local).view(1, 1)
+        return next_id
+
+    @torch.no_grad()
+    def decode_sequence(
+        self,
+        audio,
+        difficulty=5.0,
+        density_nps=6.0,
+        beatmap_id=1_000_000,
+        sampling_config=None,
+    ):
+        self.model.eval()
+        sampling_config = sampling_config or SamplingConfig()
 
         if audio.dim() == 2:
             audio = audio.unsqueeze(0)
 
         audio = audio.to(self.device)
-        generated = torch.tensor([[bos_id]], dtype=torch.long, device=self.device)
+        memory = self.model.encode_audio(audio)
+
+        generated = torch.tensor([[self.bos_id]], dtype=torch.long, device=self.device)
+        difficulty_values, density_values, beatmap_id_values = self._resolve_condition_values(
+            difficulty=difficulty,
+            density_nps=density_nps,
+            beatmap_id=beatmap_id,
+        )
 
         for _ in range(self.max_len):
             decoder_attention_mask = torch.ones_like(generated, device=self.device)
-            logits = self.model(
-                audio=audio,
+            logits = self.model.decode_with_memory(
+                memory=memory,
                 input_ids=generated,
                 decoder_attention_mask=decoder_attention_mask,
+                difficulty_values=difficulty_values,
+                density_values=density_values,
+                beatmap_id_values=beatmap_id_values,
             )
 
-            next_token_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token_id = self._sample_next_token(
+                logits_last=logits[:, -1, :],
+                generated_ids=generated[0],
+                sampling_config=sampling_config,
+            )
             generated = torch.cat([generated, next_token_id], dim=1)
 
-            if next_token_id.item() == eos_id:
+            if int(next_token_id.item()) == self.eos_id:
                 break
 
         generated_ids = generated[0].tolist()
 
-        if generated_ids and generated_ids[0] == bos_id:
+        if generated_ids and generated_ids[0] == self.bos_id:
             generated_ids = generated_ids[1:]
-        if generated_ids and generated_ids[-1] == eos_id:
+        if generated_ids and generated_ids[-1] == self.eos_id:
             generated_ids = generated_ids[:-1]
 
         generated_tokens = [self.id_to_token[i] for i in generated_ids]
         return generated_ids, generated_tokens
+
+    @torch.no_grad()
+    def greedy_decode(self, audio, difficulty=5.0, density_nps=6.0, beatmap_id=1_000_000):
+        greedy_cfg = SamplingConfig(temperature=0.0, top_p=1.0, top_k=1, ts_top_k=0)
+        return self.decode_sequence(
+            audio=audio,
+            difficulty=difficulty,
+            density_nps=density_nps,
+            beatmap_id=beatmap_id,
+            sampling_config=greedy_cfg,
+        )
 
     def preprocess_audio(self, audio_path, offset_ms, bpm, meter=4):
         timing_info = self.build_timing_info(
@@ -85,42 +282,60 @@ class TaikoBeatmapGenerator:
             meter=meter,
         )
 
-        audio_info = get_audio_info(Path(timing_info["audio_path"]))
-        waveform = audio_info["waveform"]
-        sample_rate = audio_info["sample_rate"]
-        audio_duration_ms = audio_info["audio_duration_ms"]
-
-        beat_grid_info, _ = compute_beat_grid_info(
-            offset_ms=timing_info["offset_ms"],
-            beat_duration_ms=timing_info["beat_duration_ms"],
-            audio_duration_ms=audio_duration_ms,
+        audio_key = (
+            str(Path(timing_info["audio_path"]).resolve()),
+            round(timing_info["offset_ms"], 3),
+            round(timing_info["bpm"], 6),
+            int(timing_info["meter"]),
         )
 
-        beat_aligned_frame_times_ms = build_beat_aligned_frame_timeline(
-            offset_ms=timing_info["offset_ms"],
-            beat_duration_ms=timing_info["beat_duration_ms"],
-            total_frames=beat_grid_info.total_frames,
-        )
+        def _compute_audio_sequences():
+            audio_info = get_audio_info(Path(timing_info["audio_path"]))
+            waveform = audio_info["waveform"]
+            sample_rate = audio_info["sample_rate"]
+            audio_duration_ms = audio_info["audio_duration_ms"]
 
-        mel_spec_db, orig_frame_times_ms = build_raw_mel_spectrogram(
-            waveform=waveform,
-            sample_rate=sample_rate,
-        )
+            beat_grid_info, _ = compute_beat_grid_info(
+                offset_ms=timing_info["offset_ms"],
+                beat_duration_ms=timing_info["beat_duration_ms"],
+                audio_duration_ms=audio_duration_ms,
+            )
 
-        aligned_mel_db = interpolate_raw_mel_to_beat_aligned_timeline(
-            mel_spec_db=mel_spec_db,
-            orig_frame_times_ms=orig_frame_times_ms,
-            beat_aligned_frame_times_ms=beat_aligned_frame_times_ms,
-        )
+            beat_aligned_frame_times_ms = build_beat_aligned_frame_timeline(
+                offset_ms=timing_info["offset_ms"],
+                beat_duration_ms=timing_info["beat_duration_ms"],
+                total_frames=beat_grid_info.total_frames,
+            )
 
-        audio_sequences = segment_aligned_mel_into_4beat_sequences(
-            aligned_mel_db=aligned_mel_db,
-            total_sequences=beat_grid_info.total_sequences,
-        )
+            mel_spec_db, orig_frame_times_ms = build_raw_mel_spectrogram(
+                waveform=waveform,
+                sample_rate=sample_rate,
+            )
 
-        return audio_sequences
+            aligned_mel_db = interpolate_raw_mel_to_beat_aligned_timeline(
+                mel_spec_db=mel_spec_db,
+                orig_frame_times_ms=orig_frame_times_ms,
+                beat_aligned_frame_times_ms=beat_aligned_frame_times_ms,
+            )
 
-    def generate_tokens(self, audio_path, offset_ms, bpm, meter=4):
+            return segment_aligned_mel_into_4beat_sequences(
+                aligned_mel_db=aligned_mel_db,
+                total_sequences=beat_grid_info.total_sequences,
+            )
+
+        return self._cache_get_or_compute(audio_key, _compute_audio_sequences)
+
+    def generate_tokens(
+        self,
+        audio_path,
+        offset_ms,
+        bpm,
+        meter=4,
+        difficulty=5.0,
+        density_nps=6.0,
+        beatmap_id=1_000_000,
+        sampling_config=None,
+    ):
         audio_sequences = self.preprocess_audio(
             audio_path=audio_path,
             offset_ms=offset_ms,
@@ -129,17 +344,31 @@ class TaikoBeatmapGenerator:
         )
 
         all_pred_tokens = []
-        all_pred_ids = []
 
         for seq_idx in range(len(audio_sequences)):
             audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
-            pred_ids, pred_tokens = self.greedy_decode(audio_seq)
-            all_pred_ids.append(pred_ids)
+            _, pred_tokens = self.decode_sequence(
+                audio=audio_seq,
+                difficulty=difficulty,
+                density_nps=density_nps,
+                beatmap_id=beatmap_id,
+                sampling_config=sampling_config,
+            )
             all_pred_tokens.append(pred_tokens)
 
         return all_pred_tokens
 
-    def generate_tokens_with_ids(self, audio_path, offset_ms, bpm, meter=4):
+    def generate_tokens_with_ids(
+        self,
+        audio_path,
+        offset_ms,
+        bpm,
+        meter=4,
+        difficulty=5.0,
+        density_nps=6.0,
+        beatmap_id=1_000_000,
+        sampling_config=None,
+    ):
         audio_sequences = self.preprocess_audio(
             audio_path=audio_path,
             offset_ms=offset_ms,
@@ -152,13 +381,29 @@ class TaikoBeatmapGenerator:
 
         for seq_idx in range(len(audio_sequences)):
             audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
-            pred_ids, pred_tokens = self.greedy_decode(audio_seq)
+            pred_ids, pred_tokens = self.decode_sequence(
+                audio=audio_seq,
+                difficulty=difficulty,
+                density_nps=density_nps,
+                beatmap_id=beatmap_id,
+                sampling_config=sampling_config,
+            )
             all_pred_ids.append(pred_ids)
             all_pred_tokens.append(pred_tokens)
 
         return all_pred_ids, all_pred_tokens
 
-    def generate_song_structure(self, audio_path, offset_ms, bpm, meter=4):
+    def generate_song_structure(
+        self,
+        audio_path,
+        offset_ms,
+        bpm,
+        meter=4,
+        difficulty=5.0,
+        density_nps=6.0,
+        beatmap_id=1_000_000,
+        sampling_config=None,
+    ):
         audio_sequences = self.preprocess_audio(
             audio_path=audio_path,
             offset_ms=offset_ms,
@@ -170,7 +415,13 @@ class TaikoBeatmapGenerator:
 
         for seq_idx in range(len(audio_sequences)):
             audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
-            pred_ids, pred_tokens = self.greedy_decode(audio_seq)
+            pred_ids, pred_tokens = self.decode_sequence(
+                audio=audio_seq,
+                difficulty=difficulty,
+                density_nps=density_nps,
+                beatmap_id=beatmap_id,
+                sampling_config=sampling_config,
+            )
 
             start_frame = seq_idx * 192
             end_frame = start_frame + 191

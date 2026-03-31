@@ -15,3 +15,5 @@ sample_data/unpacked/
 sample_data/beat*/
 sample_data/chart*/
 
+# Reference code
+src/difficulty/osu_taiko_reimpl_bundle/

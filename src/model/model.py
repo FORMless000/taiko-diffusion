@@ -119,6 +119,14 @@ class TaikoTransformer(nn.Module):
 
         self.token_embed = TokenEmbedding(vocab_size=vocab_size, d_model=d_model)
         self.token_pos_enc = PositionalEncoding(d_model=d_model, max_len=max_len)
+
+        self.condition_proj = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.condition_gate = nn.Parameter(torch.tensor(1.0))
+
         self.chart_decoder = ChartDecoder(
             d_model=d_model,
             nhead=nhead,
@@ -129,13 +137,45 @@ class TaikoTransformer(nn.Module):
 
         self.output_head = OutputHead(d_model=d_model, vocab_size=vocab_size)
 
-    def forward(self, audio, input_ids, decoder_attention_mask=None):
+    def _resolve_condition_values(self, values, batch_size, device):
+        if values is None:
+            return torch.full((batch_size,), 0.5, dtype=torch.float32, device=device)
+        if values.dim() == 0:
+            return values.expand(batch_size).to(device=device, dtype=torch.float32)
+        if values.dim() == 2 and values.size(1) == 1:
+            return values[:, 0].to(device=device, dtype=torch.float32)
+        return values.to(device=device, dtype=torch.float32)
+
+    def encode_audio(self, audio):
         x = self.audio_embed(audio)
         x = self.audio_pos_enc(x)
-        memory = self.audio_encoder(x)
+        return self.audio_encoder(x)
+
+    def decode_with_memory(
+        self,
+        memory,
+        input_ids,
+        decoder_attention_mask=None,
+        difficulty_values=None,
+        density_values=None,
+        beatmap_id_values=None,
+    ):
+        batch_size = input_ids.size(0)
+        device = input_ids.device
 
         tok_x = self.token_embed(input_ids)
         tok_x = self.token_pos_enc(tok_x)
+
+        resolved_difficulty = self._resolve_condition_values(difficulty_values, batch_size, device)
+        resolved_density = self._resolve_condition_values(density_values, batch_size, device)
+        resolved_beatmap = self._resolve_condition_values(beatmap_id_values, batch_size, device)
+
+        condition_input = torch.stack(
+            [resolved_difficulty, resolved_density, resolved_beatmap],
+            dim=-1,
+        )
+        condition_vec = self.condition_proj(condition_input)
+        tok_x = tok_x + self.condition_gate * condition_vec.unsqueeze(1)
 
         length = input_ids.size(1)
         tgt_mask = generate_causal_mask(length, device=input_ids.device)
@@ -153,3 +193,22 @@ class TaikoTransformer(nn.Module):
 
         logits = self.output_head(dec_out)
         return logits
+
+    def forward(
+        self,
+        audio,
+        input_ids,
+        decoder_attention_mask=None,
+        difficulty_values=None,
+        density_values=None,
+        beatmap_id_values=None,
+    ):
+        memory = self.encode_audio(audio)
+        return self.decode_with_memory(
+            memory=memory,
+            input_ids=input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            difficulty_values=difficulty_values,
+            density_values=density_values,
+            beatmap_id_values=beatmap_id_values,
+        )

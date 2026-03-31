@@ -158,6 +158,131 @@ def require_file(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} not found: {path}")
 
 
+def normalize_song_text(text: Any) -> str:
+    """Normalize song text for stable grouping keys."""
+    text_str = str(text or "").strip().lower()
+    return re.sub(r"\s+", " ", text_str)
+
+
+def load_chart_metadata(metadata_path: Path) -> Dict[str, Any]:
+    """Load parsed metadata JSON; return empty dict on missing/invalid structure."""
+    if not metadata_path.exists():
+        return {}
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    if isinstance(metadata, dict):
+        return metadata
+    return {}
+
+
+def get_chart_beatmap_id(metadata: Dict[str, Any], folder_id: Any) -> int:
+    """
+    Resolve a numeric beatmap id for conditioning.
+
+    Priority:
+    1) metadata.metadata.BeatmapID
+    2) folder_id fallback
+    """
+    metadata_block = metadata.get("metadata", {})
+    if not isinstance(metadata_block, dict):
+        metadata_block = {}
+
+    raw = metadata_block.get("BeatmapID")
+    if raw is not None and str(raw).strip():
+        try:
+            return max(1, int(str(raw).strip()))
+        except ValueError:
+            pass
+
+    try:
+        return max(1, int(str(folder_id).strip()))
+    except ValueError:
+        return 1
+
+
+def compute_chart_density_nps(model_df: pd.DataFrame) -> float:
+    """
+    Compute chart-level density using model-note times:
+    density_nps = number_of_model_notes / (last_note_time - first_note_time)
+    """
+    if model_df.empty:
+        return 0.0
+
+    times = model_df["time"].astype(float).to_numpy()
+    first_ms = float(np.min(times))
+    last_ms = float(np.max(times))
+    duration_sec = (last_ms - first_ms) / 1000.0
+    if duration_sec <= 0:
+        return 0.0
+
+    return float(len(model_df) / duration_sec)
+
+
+def get_song_group_key(metadata: Dict[str, Any]) -> str:
+    """
+    Build a stable per-song grouping key.
+
+    Priority:
+    1) metadata.metadata.BeatmapSetID
+    2) normalized Artist + Title fallback
+    """
+    metadata_block = metadata.get("metadata", {})
+    if not isinstance(metadata_block, dict):
+        metadata_block = {}
+
+    beatmap_set_id = metadata_block.get("BeatmapSetID")
+    beatmap_set_id_norm = str(beatmap_set_id).strip() if beatmap_set_id is not None else ""
+    if beatmap_set_id_norm:
+        return f"setid:{beatmap_set_id_norm}"
+
+    artist = metadata_block.get("ArtistUnicode") or metadata_block.get("Artist") or metadata.get("artist", "")
+    title = metadata_block.get("TitleUnicode") or metadata_block.get("Title") or metadata.get("title", "")
+    return f"artist_title:{normalize_song_text(artist)}|{normalize_song_text(title)}"
+
+
+def count_model_note_events_in_file(notes_path: Path) -> int:
+    """Count model note events in a notes.json file."""
+    events = load_note_events(notes_path)
+    return int(sum(1 for event in events if event.get("type") in MODEL_EVENT_TYPES))
+
+
+def filter_mapping_keep_max_notes_per_song(mapping_df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """
+    Keep only one chart per song: the chart with highest model note count.
+
+    Ties are resolved by original mapping row order.
+    """
+    rows = mapping_df.reset_index(drop=False).rename(columns={"index": "mapping_order"}).copy()
+    rows["song_group_key"] = ""
+    rows["model_note_count"] = -1
+
+    for idx, row in rows.iterrows():
+        metadata = load_chart_metadata(Path(row["metadata_path"]))
+        rows.at[idx, "song_group_key"] = get_song_group_key(metadata)
+        try:
+            rows.at[idx, "model_note_count"] = count_model_note_events_in_file(Path(row["notes_path"]))
+        except Exception as exc:
+            logging.warning(
+                "Failed to count model notes for folder_id=%s chart=%s: %s",
+                row["folder_id"],
+                row["chart_base"],
+                exc,
+            )
+
+    kept_row_indices: List[int] = []
+    for _, group in rows.groupby("song_group_key", sort=False):
+        selected = group.sort_values(
+            by=["model_note_count", "mapping_order"],
+            ascending=[False, True],
+        ).iloc[0]
+        kept_row_indices.append(int(selected.name))
+
+    kept_rows = rows.loc[kept_row_indices].sort_values("mapping_order").copy()
+    filtered_df = kept_rows.drop(columns=["mapping_order", "song_group_key", "model_note_count"]).reset_index(drop=True)
+    dropped_count = int(len(mapping_df) - len(filtered_df))
+    return filtered_df, dropped_count
+
+
 # ============================================================================
 # Step 1: build mapping table by traversing the unpacked folder
 # ============================================================================
@@ -462,6 +587,9 @@ def compute_notes_info(
 
     model_df = events_df[events_df["type"].isin(MODEL_EVENT_TYPES)].copy()
     model_df = model_df.sort_values(["frame_index_rounded", "time"]).reset_index(drop=True)
+    frame_duration_ms = beat_duration_ms / FRAMES_PER_BEAT
+    model_df["nearest_frame_time_ms"] = offset_ms + model_df["frame_index_rounded"] * frame_duration_ms
+    model_df["offgrid_abs_error_ms"] = (model_df["time"] - model_df["nearest_frame_time_ms"]).abs()
 
     outside_df = model_df[
         (model_df["frame_index_rounded"] < 0)
@@ -687,7 +815,12 @@ def build_per_sequence_event_tokens(model_df: pd.DataFrame, total_sequences: int
 # ============================================================================
 
 
-def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
+def process_one_chart_row(
+    row: pd.Series,
+    dataset_dir: Path,
+    reject_offgrid_notes: bool = True,
+    offgrid_tolerance_ms: float = 5.0,
+) -> Dict[str, Any]:
     """
     Run the full 9-step pipeline for one chart row from the mapping table.
 
@@ -702,10 +835,7 @@ def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
     timing_path = Path(row["timing_path"])
     metadata_path = Path(row["metadata_path"])
 
-    metadata: Dict[str, Any] = {}
-    if metadata_path.exists():
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
+    metadata = load_chart_metadata(metadata_path)
 
     timing_info = get_timing_info(timing_path)
     audio_info = get_audio_info(audio_path)
@@ -724,6 +854,15 @@ def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
 
     if notes_info.model_events == 0:
         raise ValueError("No modeling events found after filtering event types")
+    if reject_offgrid_notes:
+        tolerance_with_epsilon = offgrid_tolerance_ms + 1e-9
+        offgrid_df = model_df[model_df["offgrid_abs_error_ms"] > tolerance_with_epsilon]
+        if not offgrid_df.empty:
+            max_deviation_ms = float(offgrid_df["offgrid_abs_error_ms"].max())
+            raise ValueError(
+                f"Found {len(offgrid_df)} off-grid model notes (> {offgrid_tolerance_ms:.3f} ms); "
+                f"max deviation={max_deviation_ms:.3f} ms"
+            )
     if notes_info.outside_event_count > 0:
         raise ValueError(f"Found {notes_info.outside_event_count} note events outside frame grid")
     if notes_info.collision_frame_count > 0:
@@ -762,6 +901,15 @@ def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
     )
     safe_json_dump(token_data, token_json_dir / f"{chart_id}.json")
 
+    metadata_block = metadata.get("metadata", {})
+    if not isinstance(metadata_block, dict):
+        metadata_block = {}
+
+    beatmap_id = get_chart_beatmap_id(metadata, folder_id=folder_id)
+    density_nps = compute_chart_density_nps(model_df)
+    # Temporary behavior requested: difficulty is identical to density.
+    difficulty_value = density_nps
+
     sequence_metadata = []
     for seq in token_data:
         sequence_metadata.append(
@@ -769,6 +917,10 @@ def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
                 "chart_id": chart_id,
                 "folder_id": folder_id,
                 "chart_base": chart_base,
+                "beatmap_id": beatmap_id,
+                "bpm": timing_info.bpm,
+                "density_nps": density_nps,
+                "difficulty_value": difficulty_value,
                 "seq_idx": seq["seq_idx"],
                 "start_frame": seq["start_frame"],
                 "end_frame": seq["end_frame"],
@@ -783,10 +935,13 @@ def process_one_chart_row(row: pd.Series, dataset_dir: Path) -> Dict[str, Any]:
         "chart_id": chart_id,
         "folder_id": folder_id,
         "chart_base": chart_base,
-        "title": metadata.get("title", ""),
-        "artist": metadata.get("artist", ""),
-        "difficulty": metadata.get("difficulty", ""),
-        "mode": metadata.get("mode", ""),
+        "beatmap_id": beatmap_id,
+        "difficulty_value": difficulty_value,
+        "density_nps": density_nps,
+        "title": metadata.get("title", "") or metadata_block.get("Title", ""),
+        "artist": metadata.get("artist", "") or metadata_block.get("Artist", ""),
+        "difficulty": metadata.get("difficulty", "") or metadata_block.get("Version", ""),
+        "mode": metadata.get("mode", "") or metadata.get("general", {}).get("Mode", ""),
         "status": "ok",
         "error_message": "",
         "audio_path": str(audio_path),
@@ -824,6 +979,9 @@ def run_pipeline(
     unpacked_root: Path = DEFAULT_UNPACKED_ROOT,
     index_dir: Path = DEFAULT_INDEX_DIR,
     dataset_dir: Path = DEFAULT_DATASET_DIR,
+    reject_offgrid_notes: bool = True,
+    offgrid_tolerance_ms: float = 5.0,
+    keep_only_max_notes_per_song: bool = False,
 ) -> None:
     """
     End-to-end execution:
@@ -849,6 +1007,16 @@ def run_pipeline(
     if mapping_df.empty:
         raise RuntimeError("No valid chart mapping rows were created")
 
+    if keep_only_max_notes_per_song:
+        mapping_df, dropped_count = filter_mapping_keep_max_notes_per_song(mapping_df)
+        logging.info(
+            "Song-level max-note filter enabled: kept %d rows, dropped %d rows",
+            len(mapping_df),
+            dropped_count,
+        )
+        if mapping_df.empty:
+            raise RuntimeError("No charts remain after song-level max-note filtering")
+
     chart_summaries: List[Dict[str, Any]] = []
     sequence_metadata_rows: List[Dict[str, Any]] = []
 
@@ -859,7 +1027,12 @@ def run_pipeline(
             logging.info("Processing %d / %d | %s", i, total_rows, chart_label)
 
         try:
-            result = process_one_chart_row(row, dataset_dir)
+            result = process_one_chart_row(
+                row,
+                dataset_dir,
+                reject_offgrid_notes=reject_offgrid_notes,
+                offgrid_tolerance_ms=offgrid_tolerance_ms,
+            )
             chart_summaries.append(result["summary"])
             sequence_metadata_rows.extend(result["sequence_metadata"])
         except Exception as exc:
