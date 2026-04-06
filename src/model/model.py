@@ -159,6 +159,7 @@ class TaikoTransformer(nn.Module):
         difficulty_values=None,
         density_values=None,
         beatmap_id_values=None,
+        segment_ids=None,
     ):
         batch_size = input_ids.size(0)
         device = input_ids.device
@@ -202,6 +203,7 @@ class TaikoTransformer(nn.Module):
         difficulty_values=None,
         density_values=None,
         beatmap_id_values=None,
+        segment_ids=None,
     ):
         memory = self.encode_audio(audio)
         return self.decode_with_memory(
@@ -211,4 +213,5 @@ class TaikoTransformer(nn.Module):
             difficulty_values=difficulty_values,
             density_values=density_values,
             beatmap_id_values=beatmap_id_values,
+            segment_ids=segment_ids,
         )

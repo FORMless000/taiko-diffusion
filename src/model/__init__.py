@@ -12,7 +12,36 @@ from .data import (
     preprocess_density_nps,
     preprocess_beatmap_id,
     TaikoDataset,
+    TaikoContextDataset,
     taiko_collate_fn,
+    taiko_context_collate_fn,
+    build_dataset_for_spec,
+)
+from .specs import (
+    ArchitectureSpec,
+    TrainingSpec,
+)
+from .factory import (
+    build_model,
+    register_model_builder,
+)
+from .checkpoints import (
+    CheckpointMetadata,
+    capture_rng_states,
+    restore_rng_states,
+    save_checkpoint,
+    load_checkpoint,
+)
+from .train_api import (
+    TrainingArtifacts,
+    DatasetBundle,
+    TrainingContext,
+    build_training_artifacts,
+    prepare_sample_data_artifacts,
+    create_dataset_bundle,
+    create_training_context,
+    load_training_context_from_checkpoint,
+    train_context,
 )
 from .model import (
     AudioEmbedding,
@@ -24,17 +53,26 @@ from .model import (
     OutputHead,
     TaikoTransformer,
 )
+from .taiko_context import (
+    TaikoContextTransformer,
+)
 from .trainer import (
     train_one_epoch,
     validate_one_epoch,
     fit,
     plot_loss,
 )
-from .generation import (
-    SamplingConfig,
-    TaikoBeatmapGenerator,
-    compare_song_output_with_notes_json,
-)
+
+try:
+    from .generation import (
+        SamplingConfig,
+        TaikoBeatmapGenerator,
+        compare_song_output_with_notes_json,
+    )
+except ImportError:
+    SamplingConfig = None
+    TaikoBeatmapGenerator = None
+    compare_song_output_with_notes_json = None
 
 __all__ = [
     "build_chart_manifest",
@@ -50,7 +88,28 @@ __all__ = [
     "preprocess_density_nps",
     "preprocess_beatmap_id",
     "TaikoDataset",
+    "TaikoContextDataset",
     "taiko_collate_fn",
+    "taiko_context_collate_fn",
+    "build_dataset_for_spec",
+    "ArchitectureSpec",
+    "TrainingSpec",
+    "build_model",
+    "register_model_builder",
+    "CheckpointMetadata",
+    "capture_rng_states",
+    "restore_rng_states",
+    "save_checkpoint",
+    "load_checkpoint",
+    "TrainingArtifacts",
+    "DatasetBundle",
+    "TrainingContext",
+    "build_training_artifacts",
+    "prepare_sample_data_artifacts",
+    "create_dataset_bundle",
+    "create_training_context",
+    "load_training_context_from_checkpoint",
+    "train_context",
     "AudioEmbedding",
     "PositionalEncoding",
     "AudioEncoder",
@@ -59,11 +118,18 @@ __all__ = [
     "generate_causal_mask",
     "OutputHead",
     "TaikoTransformer",
+    "TaikoContextTransformer",
     "train_one_epoch",
     "validate_one_epoch",
     "fit",
     "plot_loss",
-    "SamplingConfig",
-    "TaikoBeatmapGenerator",
-    "compare_song_output_with_notes_json",
 ]
+
+if SamplingConfig is not None:
+    __all__.extend(
+        [
+            "SamplingConfig",
+            "TaikoBeatmapGenerator",
+            "compare_song_output_with_notes_json",
+        ]
+    )

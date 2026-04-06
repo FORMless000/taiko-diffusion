@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+import random
+from typing import Any
+
+import numpy as np
+import torch
+
+from .specs import ArchitectureSpec, TrainingSpec
+
+
+@dataclass
+class CheckpointMetadata:
+    epoch: int
+    global_step: int
+    best_val_loss: float | None
+    data_root: str
+    artifact_paths: dict[str, str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CheckpointMetadata":
+        return cls(**data)
+
+
+def capture_rng_states() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "torch_cuda": None,
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_states(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+
+    python_state = state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+
+    numpy_state = state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def save_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    architecture_spec: ArchitectureSpec,
+    training_spec: TrainingSpec,
+    metadata: CheckpointMetadata,
+    history: dict[str, Any],
+    vocab: dict[str, Any],
+    split_ids: dict[str, list[str]],
+    adherence_config: dict[str, Any] | None = None,
+    scheduler: Any = None,
+) -> Path:
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "metadata": metadata.to_dict(),
+        "architecture_spec": architecture_spec.to_dict(),
+        "training_spec": training_spec.to_dict(),
+        "history": history,
+        "vocab": vocab,
+        "split_ids": split_ids,
+        "adherence_config": adherence_config or {},
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
+        "rng_state": capture_rng_states(),
+    }
+
+    torch.save(payload, checkpoint_path)
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path: str | Path, map_location: str | torch.device | None = None) -> dict[str, Any]:
+    checkpoint_path = Path(checkpoint_path)
+    return torch.load(checkpoint_path, map_location=map_location, weights_only=False)

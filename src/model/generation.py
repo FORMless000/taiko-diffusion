@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import math
 import torch
+import torch.nn.functional as F
 
 from src.model.data import (
     preprocess_beatmap_id,
@@ -43,6 +44,12 @@ class TaikoBeatmapGenerator:
         self.pad_id = token_to_id.get("PAD")
         self.bos_id = token_to_id["BOS"]
         self.eos_id = token_to_id["EOS"]
+        self.context_enabled = bool(getattr(model, "supports_long_context", False))
+        self.history_max_tokens = max(1, int(getattr(model, "history_max_tokens", 1024)))
+        self.retrieval_top_k = max(0, int(getattr(model, "retrieval_top_k", 0)))
+        self.retrieval_max_tokens_per_window = max(1, int(getattr(model, "retrieval_max_tokens_per_window", 64)))
+        self.retrieval_exclude_last_n_windows = max(0, int(getattr(model, "retrieval_exclude_last_n_windows", 0)))
+        self.use_motif_retrieval = bool(getattr(model, "use_motif_retrieval", False))
 
         ts_ids = []
         event_ids = []
@@ -99,6 +106,67 @@ class TaikoBeatmapGenerator:
         density_values = torch.tensor([density_norm], dtype=torch.float32, device=self.device)
         beatmap_id_values = torch.tensor([beatmap_id_norm], dtype=torch.float32, device=self.device)
         return difficulty_values, density_values, beatmap_id_values
+
+    def _pool_audio_key_from_memory(self, memory):
+        if hasattr(self.model, "_pool_audio_memory"):
+            return self.model._pool_audio_memory(memory)[0]
+
+        pooled = memory.mean(dim=1)
+        return F.normalize(pooled, dim=-1)[0]
+
+    def _build_recent_history_ids(self, prior_window_token_ids):
+        flattened = []
+        for token_ids in prior_window_token_ids:
+            flattened.extend(token_ids)
+
+        if len(flattened) > self.history_max_tokens:
+            flattened = flattened[-self.history_max_tokens :]
+        return flattened
+
+    def _truncate_retrieved_window_ids(self, token_ids):
+        limit = self.retrieval_max_tokens_per_window
+        payload = list(token_ids[: max(0, limit - 1)])
+        payload.append(self.eos_id)
+        return payload[:limit]
+
+    def _build_retrieved_ids(self, current_audio_key, prior_audio_keys, prior_window_token_ids):
+        if not self.context_enabled or not self.use_motif_retrieval or self.retrieval_top_k <= 0:
+            return []
+
+        eligible_count = len(prior_window_token_ids) - self.retrieval_exclude_last_n_windows
+        if eligible_count <= 0:
+            return []
+
+        candidate_keys = torch.stack(prior_audio_keys[:eligible_count], dim=0)
+        similarity = torch.matmul(candidate_keys, current_audio_key.unsqueeze(-1)).squeeze(-1)
+        top_k = min(self.retrieval_top_k, int(similarity.numel()))
+        if top_k <= 0:
+            return []
+
+        _, top_indices = torch.topk(similarity, k=top_k)
+        retrieved_ids = []
+        for idx in top_indices.tolist():
+            retrieved_ids.extend(self._truncate_retrieved_window_ids(prior_window_token_ids[idx]))
+        return retrieved_ids
+
+    def _build_context_tensors(self, generated, recent_history_ids=None, retrieved_token_ids=None):
+        if not self.context_enabled:
+            return generated, None
+
+        history_ids = list(recent_history_ids or [])
+        retrieved_ids = list(retrieved_token_ids or [])
+        current_ids = generated[0].tolist()
+
+        full_input_ids = history_ids + retrieved_ids + current_ids
+        segment_ids = (
+            [0] * len(history_ids)
+            + [1] * len(retrieved_ids)
+            + [2] * len(current_ids)
+        )
+
+        input_ids = torch.tensor([full_input_ids], dtype=torch.long, device=self.device)
+        segment_ids = torch.tensor([segment_ids], dtype=torch.long, device=self.device)
+        return input_ids, segment_ids
 
     def _apply_repetition_penalty(self, logits, generated_ids, repetition_penalty):
         if repetition_penalty is None or repetition_penalty <= 1.0 or generated_ids.numel() == 0:
@@ -215,15 +283,22 @@ class TaikoBeatmapGenerator:
         density_nps=6.0,
         beatmap_id=1_000_000,
         sampling_config=None,
+        memory=None,
+        recent_history_ids=None,
+        retrieved_token_ids=None,
     ):
         self.model.eval()
         sampling_config = sampling_config or SamplingConfig()
 
-        if audio.dim() == 2:
-            audio = audio.unsqueeze(0)
-
-        audio = audio.to(self.device)
-        memory = self.model.encode_audio(audio)
+        if memory is None:
+            if audio is None:
+                raise ValueError("audio or memory must be provided for decoding.")
+            if audio.dim() == 2:
+                audio = audio.unsqueeze(0)
+            audio = audio.to(self.device)
+            memory = self.model.encode_audio(audio)
+        else:
+            memory = memory.to(self.device)
 
         generated = torch.tensor([[self.bos_id]], dtype=torch.long, device=self.device)
         difficulty_values, density_values, beatmap_id_values = self._resolve_condition_values(
@@ -233,15 +308,25 @@ class TaikoBeatmapGenerator:
         )
 
         for _ in range(self.max_len):
-            decoder_attention_mask = torch.ones_like(generated, device=self.device)
-            logits = self.model.decode_with_memory(
-                memory=memory,
-                input_ids=generated,
-                decoder_attention_mask=decoder_attention_mask,
-                difficulty_values=difficulty_values,
-                density_values=density_values,
-                beatmap_id_values=beatmap_id_values,
+            decode_input_ids, segment_ids = self._build_context_tensors(
+                generated,
+                recent_history_ids=recent_history_ids,
+                retrieved_token_ids=retrieved_token_ids,
             )
+            decoder_attention_mask = torch.ones_like(decode_input_ids, device=self.device)
+
+            decode_kwargs = {
+                "memory": memory,
+                "input_ids": decode_input_ids,
+                "decoder_attention_mask": decoder_attention_mask,
+                "difficulty_values": difficulty_values,
+                "density_values": density_values,
+                "beatmap_id_values": beatmap_id_values,
+            }
+            if segment_ids is not None:
+                decode_kwargs["segment_ids"] = segment_ids
+
+            logits = self.model.decode_with_memory(**decode_kwargs)
 
             next_token_id = self._sample_next_token(
                 logits_last=logits[:, -1, :],
@@ -336,27 +421,19 @@ class TaikoBeatmapGenerator:
         beatmap_id=1_000_000,
         sampling_config=None,
     ):
-        audio_sequences = self.preprocess_audio(
-            audio_path=audio_path,
-            offset_ms=offset_ms,
-            bpm=bpm,
-            meter=meter,
-        )
-
-        all_pred_tokens = []
-
-        for seq_idx in range(len(audio_sequences)):
-            audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
-            _, pred_tokens = self.decode_sequence(
-                audio=audio_seq,
+        return [
+            item["pred_tokens"]
+            for item in self.generate_song_structure(
+                audio_path=audio_path,
+                offset_ms=offset_ms,
+                bpm=bpm,
+                meter=meter,
                 difficulty=difficulty,
                 density_nps=density_nps,
                 beatmap_id=beatmap_id,
                 sampling_config=sampling_config,
             )
-            all_pred_tokens.append(pred_tokens)
-
-        return all_pred_tokens
+        ]
 
     def generate_tokens_with_ids(
         self,
@@ -369,28 +446,18 @@ class TaikoBeatmapGenerator:
         beatmap_id=1_000_000,
         sampling_config=None,
     ):
-        audio_sequences = self.preprocess_audio(
+        song_output = self.generate_song_structure(
             audio_path=audio_path,
             offset_ms=offset_ms,
             bpm=bpm,
             meter=meter,
+            difficulty=difficulty,
+            density_nps=density_nps,
+            beatmap_id=beatmap_id,
+            sampling_config=sampling_config,
         )
-
-        all_pred_tokens = []
-        all_pred_ids = []
-
-        for seq_idx in range(len(audio_sequences)):
-            audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
-            pred_ids, pred_tokens = self.decode_sequence(
-                audio=audio_seq,
-                difficulty=difficulty,
-                density_nps=density_nps,
-                beatmap_id=beatmap_id,
-                sampling_config=sampling_config,
-            )
-            all_pred_ids.append(pred_ids)
-            all_pred_tokens.append(pred_tokens)
-
+        all_pred_ids = [item["pred_ids"] for item in song_output]
+        all_pred_tokens = [item["pred_tokens"] for item in song_output]
         return all_pred_ids, all_pred_tokens
 
     def generate_song_structure(
@@ -412,15 +479,35 @@ class TaikoBeatmapGenerator:
         )
 
         song_output = []
+        prior_window_token_ids = []
+        prior_audio_keys = []
 
         for seq_idx in range(len(audio_sequences)):
             audio_seq = torch.tensor(audio_sequences[seq_idx], dtype=torch.float32)
+            decode_kwargs = {
+                "audio": audio_seq,
+                "difficulty": difficulty,
+                "density_nps": density_nps,
+                "beatmap_id": beatmap_id,
+                "sampling_config": sampling_config,
+            }
+
+            if self.context_enabled:
+                audio_batch = audio_seq.unsqueeze(0).to(self.device)
+                memory = self.model.encode_audio(audio_batch)
+                current_audio_key = self._pool_audio_key_from_memory(memory)
+                recent_history_ids = self._build_recent_history_ids(prior_window_token_ids)
+                retrieved_ids = self._build_retrieved_ids(
+                    current_audio_key,
+                    prior_audio_keys,
+                    prior_window_token_ids,
+                )
+                decode_kwargs["memory"] = memory
+                decode_kwargs["recent_history_ids"] = recent_history_ids
+                decode_kwargs["retrieved_token_ids"] = retrieved_ids
+
             pred_ids, pred_tokens = self.decode_sequence(
-                audio=audio_seq,
-                difficulty=difficulty,
-                density_nps=density_nps,
-                beatmap_id=beatmap_id,
-                sampling_config=sampling_config,
+                **decode_kwargs,
             )
 
             start_frame = seq_idx * 192
@@ -435,6 +522,10 @@ class TaikoBeatmapGenerator:
                     "pred_tokens": pred_tokens,
                 }
             )
+
+            if self.context_enabled:
+                prior_window_token_ids.append(pred_ids + [self.eos_id])
+                prior_audio_keys.append(current_audio_key.detach().clone())
 
         return song_output
 

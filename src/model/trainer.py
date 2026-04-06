@@ -3,13 +3,15 @@ from tqdm import tqdm
 import torch
 
 
-def _compute_adherence_metrics(logits, labels, density_values, difficulty_values, ts_token_ids, pad_id=0):
+def _compute_adherence_metrics(logits, labels, density_values, difficulty_values, ts_token_ids, pad_id=0, ignore_index=0):
     if ts_token_ids is None:
         return {}
 
     with torch.no_grad():
         pred_ids = torch.argmax(logits, dim=-1)
-        valid_mask = labels != pad_id
+        valid_mask = labels != ignore_index
+        if ignore_index != pad_id:
+            valid_mask = valid_mask & (labels != pad_id)
 
         if valid_mask.sum().item() == 0:
             return {}
@@ -49,9 +51,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
 
     ts_token_ids = None
     pad_id = 0
+    ignore_index = pad_id
     if adherence_config is not None:
         ts_token_ids = adherence_config.get("ts_token_ids")
         pad_id = int(adherence_config.get("pad_id", 0))
+        ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
     for batch in pbar:
         audio = batch["audio"].to(device)
@@ -64,14 +68,18 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
 
         optimizer.zero_grad()
 
-        logits = model(
-            audio=audio,
-            input_ids=input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            difficulty_values=difficulty_values,
-            density_values=density_values,
-            beatmap_id_values=beatmap_id_values,
-        )
+        model_inputs = {
+            "audio": audio,
+            "input_ids": input_ids,
+            "decoder_attention_mask": decoder_attention_mask,
+            "difficulty_values": difficulty_values,
+            "density_values": density_values,
+            "beatmap_id_values": beatmap_id_values,
+        }
+        if "segment_ids" in batch:
+            model_inputs["segment_ids"] = batch["segment_ids"].to(device)
+
+        logits = model(**model_inputs)
 
         loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
         loss.backward()
@@ -84,6 +92,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
             difficulty_values=difficulty_values,
             ts_token_ids=ts_token_ids,
             pad_id=pad_id,
+            ignore_index=ignore_index,
         )
 
         total_loss += loss.item()
@@ -119,9 +128,11 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
 
     ts_token_ids = None
     pad_id = 0
+    ignore_index = pad_id
     if adherence_config is not None:
         ts_token_ids = adherence_config.get("ts_token_ids")
         pad_id = int(adherence_config.get("pad_id", 0))
+        ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
     for batch in pbar:
         audio = batch["audio"].to(device)
@@ -132,14 +143,18 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
         density_values = batch["density_values"].to(device)
         beatmap_id_values = batch["beatmap_id_values"].to(device)
 
-        logits = model(
-            audio=audio,
-            input_ids=input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            difficulty_values=difficulty_values,
-            density_values=density_values,
-            beatmap_id_values=beatmap_id_values,
-        )
+        model_inputs = {
+            "audio": audio,
+            "input_ids": input_ids,
+            "decoder_attention_mask": decoder_attention_mask,
+            "difficulty_values": difficulty_values,
+            "density_values": density_values,
+            "beatmap_id_values": beatmap_id_values,
+        }
+        if "segment_ids" in batch:
+            model_inputs["segment_ids"] = batch["segment_ids"].to(device)
+
+        logits = model(**model_inputs)
 
         loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
@@ -150,6 +165,7 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
             difficulty_values=difficulty_values,
             ts_token_ids=ts_token_ids,
             pad_id=pad_id,
+            ignore_index=ignore_index,
         )
 
         total_loss += loss.item()

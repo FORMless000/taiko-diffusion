@@ -1,4 +1,5 @@
 from pathlib import Path
+from functools import partial
 import json
 import re
 import numpy as np
@@ -15,6 +16,7 @@ DENSITY_NPS_MIN = 1.0
 DENSITY_NPS_MAX = 20.0
 BEATMAP_ID_MIN = 1.0
 BEATMAP_ID_MAX = 5_000_000.0
+CONTEXT_LABEL_IGNORE_INDEX = -100
 
 
 def _safe_float(value, default):
@@ -282,6 +284,10 @@ def encode_tokens(tokens, token_to_id):
     return input_ids, labels
 
 
+def is_context_architecture_name(name):
+    return str(name).strip() == "taiko_context_transformer"
+
+
 class TaikoDataset(Dataset):
     def __init__(self, seq_index_df, token_to_id):
         self.seq_index_df = seq_index_df.reset_index(drop=True)
@@ -302,6 +308,180 @@ class TaikoDataset(Dataset):
             "difficulty_value": torch.tensor(sample["difficulty_value_norm"], dtype=torch.float32),
             "density_value": torch.tensor(sample["density_value_norm"], dtype=torch.float32),
             "beatmap_id_value": torch.tensor(sample["beatmap_id_value_norm"], dtype=torch.float32),
+        }
+
+
+class TaikoContextDataset(Dataset):
+    def __init__(
+        self,
+        seq_index_df,
+        token_to_id,
+        history_max_tokens=1024,
+        retrieval_top_k=2,
+        retrieval_max_tokens_per_window=64,
+        retrieval_exclude_last_n_windows=2,
+        use_motif_retrieval=True,
+    ):
+        self.seq_index_df = seq_index_df.reset_index(drop=True)
+        self.token_to_id = token_to_id
+        self.history_max_tokens = max(1, int(history_max_tokens))
+        self.retrieval_top_k = max(0, int(retrieval_top_k))
+        self.retrieval_max_tokens_per_window = max(1, int(retrieval_max_tokens_per_window))
+        self.retrieval_exclude_last_n_windows = max(0, int(retrieval_exclude_last_n_windows))
+        self.use_motif_retrieval = bool(use_motif_retrieval)
+        self.eos_id = int(token_to_id["EOS"])
+
+        self._chart_rows = {}
+        for _, row in self.seq_index_df.iterrows():
+            row_dict = row.to_dict()
+            chart_id = row_dict["chart_id"]
+            self._chart_rows.setdefault(chart_id, []).append(row_dict)
+
+        for chart_id in self._chart_rows:
+            self._chart_rows[chart_id].sort(key=lambda row: int(row["seq_idx"]))
+
+        self._chart_cache = {}
+
+    def __len__(self):
+        return len(self.seq_index_df)
+
+    def _build_sample_from_assets(self, row, audio_arr, token_data):
+        seq_idx = int(row["seq_idx"])
+        audio = audio_arr[seq_idx]
+        tokens = token_data[seq_idx]["tokens"]
+
+        raw_diff_value = row.get("difficulty_value", row.get("difficulty", ""))
+        difficulty_value = infer_difficulty_value(raw_diff_value)
+
+        beatmap_id_raw = infer_beatmap_id_value(
+            chart_id=row.get("chart_id", ""),
+            explicit_beatmap_id=row.get("beatmap_id", None),
+        )
+
+        explicit_density = row.get("density_nps", "")
+        if explicit_density is not None and str(explicit_density).strip() != "":
+            density_nps = _safe_float(explicit_density, 6.0)
+        else:
+            density_nps = infer_density_nps(tokens=tokens, bpm=row.get("bpm", 120.0))
+
+        token_ids = [self.token_to_id[t] for t in tokens]
+        audio_key = np.asarray(audio, dtype=np.float32).mean(axis=0)
+        norm = float(np.linalg.norm(audio_key))
+        if norm > 0.0:
+            audio_key = audio_key / norm
+
+        return {
+            "chart_id": row["chart_id"],
+            "seq_idx": seq_idx,
+            "audio": audio,
+            "tokens": tokens,
+            "token_ids": token_ids,
+            "audio_key": audio_key.astype(np.float32, copy=False),
+            "difficulty_value_norm": preprocess_difficulty_value(difficulty_value),
+            "density_value_norm": preprocess_density_nps(density_nps),
+            "beatmap_id_value_norm": preprocess_beatmap_id(beatmap_id_raw),
+        }
+
+    def _load_chart_samples(self, chart_id):
+        if chart_id in self._chart_cache:
+            return self._chart_cache[chart_id]
+
+        rows = self._chart_rows[chart_id]
+        audio_arr = np.load(rows[0]["npz_path"])["audio_sequences"]
+        with open(rows[0]["json_path"], "r", encoding="utf-8") as f:
+            token_data = json.load(f)
+
+        ordered = []
+        by_seq = {}
+        for row in rows:
+            sample = self._build_sample_from_assets(row, audio_arr, token_data)
+            ordered.append(sample)
+            by_seq[int(sample["seq_idx"])] = sample
+
+        payload = {"ordered": ordered, "by_seq": by_seq}
+        self._chart_cache[chart_id] = payload
+        return payload
+
+    def _serialize_window_token_ids(self, token_ids, limit=None):
+        if limit is None:
+            return list(token_ids) + [self.eos_id]
+
+        limit = max(1, int(limit))
+        payload = list(token_ids[: max(0, limit - 1)])
+        payload.append(self.eos_id)
+        return payload[:limit]
+
+    def _build_recent_history_ids(self, ordered_samples, current_seq_idx):
+        history_ids = []
+        for sample in ordered_samples:
+            if int(sample["seq_idx"]) >= int(current_seq_idx):
+                break
+            history_ids.extend(self._serialize_window_token_ids(sample["token_ids"]))
+
+        if len(history_ids) > self.history_max_tokens:
+            history_ids = history_ids[-self.history_max_tokens :]
+        return history_ids
+
+    def _build_retrieved_ids(self, ordered_samples, current_sample):
+        if not self.use_motif_retrieval or self.retrieval_top_k <= 0:
+            return []
+
+        current_seq_idx = int(current_sample["seq_idx"])
+        cutoff_seq_idx = current_seq_idx - self.retrieval_exclude_last_n_windows
+        candidates = []
+
+        for sample in ordered_samples:
+            sample_seq_idx = int(sample["seq_idx"])
+            if sample_seq_idx >= current_seq_idx:
+                break
+            if sample_seq_idx >= cutoff_seq_idx:
+                continue
+
+            similarity = float(np.dot(current_sample["audio_key"], sample["audio_key"]))
+            candidates.append((similarity, sample_seq_idx, sample))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        retrieved_ids = []
+        for _, _, sample in candidates[: self.retrieval_top_k]:
+            retrieved_ids.extend(
+                self._serialize_window_token_ids(
+                    sample["token_ids"],
+                    limit=self.retrieval_max_tokens_per_window,
+                )
+            )
+        return retrieved_ids
+
+    def __getitem__(self, idx):
+        row = self.seq_index_df.iloc[idx].to_dict()
+        chart_payload = self._load_chart_samples(row["chart_id"])
+        current_sample = chart_payload["by_seq"][int(row["seq_idx"])]
+
+        current_input_ids, current_labels = encode_tokens(current_sample["tokens"], self.token_to_id)
+        history_ids = self._build_recent_history_ids(chart_payload["ordered"], current_sample["seq_idx"])
+        retrieved_ids = self._build_retrieved_ids(chart_payload["ordered"], current_sample)
+
+        input_ids = history_ids + retrieved_ids + current_input_ids
+        labels = (
+            [CONTEXT_LABEL_IGNORE_INDEX] * (len(history_ids) + len(retrieved_ids))
+            + current_labels
+        )
+        segment_ids = (
+            [0] * len(history_ids)
+            + [1] * len(retrieved_ids)
+            + [2] * len(current_input_ids)
+        )
+
+        return {
+            "audio": torch.tensor(current_sample["audio"], dtype=torch.float32),
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "segment_ids": torch.tensor(segment_ids, dtype=torch.long),
+            "difficulty_value": torch.tensor(current_sample["difficulty_value_norm"], dtype=torch.float32),
+            "density_value": torch.tensor(current_sample["density_value_norm"], dtype=torch.float32),
+            "beatmap_id_value": torch.tensor(current_sample["beatmap_id_value_norm"], dtype=torch.float32),
         }
 
 
@@ -333,3 +513,57 @@ def taiko_collate_fn(batch, pad_id=0):
     }
 
 
+def taiko_context_collate_fn(batch, pad_id=0, ignore_index=CONTEXT_LABEL_IGNORE_INDEX):
+    audio_list = [item["audio"] for item in batch]
+    input_ids_list = [item["input_ids"] for item in batch]
+    labels_list = [item["labels"] for item in batch]
+    segment_ids_list = [item["segment_ids"] for item in batch]
+    difficulty_value_list = [item["difficulty_value"] for item in batch]
+    density_value_list = [item["density_value"] for item in batch]
+    beatmap_id_value_list = [item["beatmap_id_value"] for item in batch]
+
+    audio = torch.stack(audio_list, dim=0)
+    input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+    labels = pad_sequence(labels_list, batch_first=True, padding_value=ignore_index)
+    segment_ids = pad_sequence(segment_ids_list, batch_first=True, padding_value=0)
+    decoder_attention_mask = (input_ids != pad_id).long()
+
+    difficulty_values = torch.stack(difficulty_value_list, dim=0)
+    density_values = torch.stack(density_value_list, dim=0)
+    beatmap_id_values = torch.stack(beatmap_id_value_list, dim=0)
+
+    return {
+        "audio": audio,
+        "input_ids": input_ids,
+        "labels": labels,
+        "segment_ids": segment_ids,
+        "decoder_attention_mask": decoder_attention_mask,
+        "difficulty_values": difficulty_values,
+        "density_values": density_values,
+        "beatmap_id_values": beatmap_id_values,
+    }
+
+
+def build_dataset_for_spec(seq_index_df, token_to_id, architecture_spec):
+    pad_id = int(token_to_id["PAD"])
+
+    if is_context_architecture_name(getattr(architecture_spec, "name", architecture_spec)):
+        dataset = TaikoContextDataset(
+            seq_index_df=seq_index_df,
+            token_to_id=token_to_id,
+            history_max_tokens=getattr(architecture_spec, "history_max_tokens", 1024),
+            retrieval_top_k=getattr(architecture_spec, "retrieval_top_k", 2),
+            retrieval_max_tokens_per_window=getattr(architecture_spec, "retrieval_max_tokens_per_window", 64),
+            retrieval_exclude_last_n_windows=getattr(architecture_spec, "retrieval_exclude_last_n_windows", 2),
+            use_motif_retrieval=getattr(architecture_spec, "use_motif_retrieval", True),
+        )
+        collate_fn = partial(
+            taiko_context_collate_fn,
+            pad_id=pad_id,
+            ignore_index=CONTEXT_LABEL_IGNORE_INDEX,
+        )
+        return dataset, collate_fn, CONTEXT_LABEL_IGNORE_INDEX
+
+    dataset = TaikoDataset(seq_index_df, token_to_id)
+    collate_fn = partial(taiko_collate_fn, pad_id=pad_id)
+    return dataset, collate_fn, pad_id
