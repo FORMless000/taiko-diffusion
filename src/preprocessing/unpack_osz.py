@@ -40,17 +40,16 @@ def _clean_to_chart_and_audio_only(directory: Path) -> None:
                 pass
 
 
-def unpack_osz_files(
-    source_glob: str,
+def _unpack_osz_paths(
+    source_files: list[Path],
     destination_root: str | Path,
     overwrite: bool = False,
     keep_only_chart_and_audio: bool = True,
 ) -> list[Path]:
-    """Unpack all .osz files matched by ``source_glob`` into ``destination_root``.
+    """Unpack explicit `.osz` paths into ``destination_root``.
 
     Each archive is extracted into its own subfolder named after the .osz filename stem.
     """
-    source_files = sorted(Path(path) for path in glob(source_glob))
     destination_root = Path(destination_root)
     destination_root.mkdir(parents=True, exist_ok=True)
 
@@ -80,6 +79,36 @@ def unpack_osz_files(
         extracted_dirs.append(target_dir)
 
     return extracted_dirs
+
+
+def unpack_osz_paths(
+    source_paths: list[str | Path],
+    destination_root: str | Path,
+    overwrite: bool = False,
+    keep_only_chart_and_audio: bool = True,
+) -> list[Path]:
+    resolved_paths = sorted(Path(path) for path in source_paths)
+    return _unpack_osz_paths(
+        source_files=resolved_paths,
+        destination_root=destination_root,
+        overwrite=overwrite,
+        keep_only_chart_and_audio=keep_only_chart_and_audio,
+    )
+
+
+def unpack_osz_files(
+    source_glob: str,
+    destination_root: str | Path,
+    overwrite: bool = False,
+    keep_only_chart_and_audio: bool = True,
+) -> list[Path]:
+    source_files = sorted(Path(path) for path in glob(source_glob))
+    return _unpack_osz_paths(
+        source_files=source_files,
+        destination_root=destination_root,
+        overwrite=overwrite,
+        keep_only_chart_and_audio=keep_only_chart_and_audio,
+    )
 
 
 if __name__ == "__main__":

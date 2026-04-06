@@ -1,6 +1,14 @@
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+from contextlib import nullcontext
+
 import torch
+from tqdm import tqdm
+
+
+def _autocast_context(device, use_amp):
+    enabled = bool(use_amp) and getattr(device, "type", "cpu") == "cuda"
+    if not enabled:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.float16)
 
 
 def _compute_adherence_metrics(logits, labels, density_values, difficulty_values, ts_token_ids, pad_id=0):
@@ -38,7 +46,16 @@ def _compute_adherence_metrics(logits, labels, density_values, difficulty_values
         }
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_config=None):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    adherence_config=None,
+    scaler=None,
+    use_amp=False,
+):
     model.train()
 
     total_loss = 0.0
@@ -64,18 +81,25 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
 
         optimizer.zero_grad()
 
-        logits = model(
-            audio=audio,
-            input_ids=input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            difficulty_values=difficulty_values,
-            density_values=density_values,
-            beatmap_id_values=beatmap_id_values,
-        )
+        with _autocast_context(device, use_amp):
+            logits = model(
+                audio=audio,
+                input_ids=input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                difficulty_values=difficulty_values,
+                density_values=density_values,
+                beatmap_id_values=beatmap_id_values,
+            )
 
-        loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-        loss.backward()
-        optimizer.step()
+            loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+
+        if scaler is not None and bool(use_amp) and getattr(device, "type", "cpu") == "cuda":
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         metrics = _compute_adherence_metrics(
             logits=logits,
@@ -108,7 +132,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
 
 
 @torch.no_grad()
-def validate_one_epoch(model, dataloader, criterion, device, adherence_config=None):
+def validate_one_epoch(
+    model,
+    dataloader,
+    criterion,
+    device,
+    adherence_config=None,
+    use_amp=False,
+):
     model.eval()
 
     total_loss = 0.0
@@ -132,16 +163,17 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
         density_values = batch["density_values"].to(device)
         beatmap_id_values = batch["beatmap_id_values"].to(device)
 
-        logits = model(
-            audio=audio,
-            input_ids=input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            difficulty_values=difficulty_values,
-            density_values=density_values,
-            beatmap_id_values=beatmap_id_values,
-        )
+        with _autocast_context(device, use_amp):
+            logits = model(
+                audio=audio,
+                input_ids=input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                difficulty_values=difficulty_values,
+                density_values=density_values,
+                beatmap_id_values=beatmap_id_values,
+            )
 
-        loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
         metrics = _compute_adherence_metrics(
             logits=logits,
@@ -183,6 +215,8 @@ def fit(
     num_epochs=50,
     scheduler=None,
     adherence_config=None,
+    scaler=None,
+    use_amp=False,
 ):
     history = {
         "train_loss": [],
@@ -202,6 +236,8 @@ def fit(
             criterion=criterion,
             device=device,
             adherence_config=adherence_config,
+            scaler=scaler,
+            use_amp=use_amp,
         )
 
         val_stats = validate_one_epoch(
@@ -210,6 +246,7 @@ def fit(
             criterion=criterion,
             device=device,
             adherence_config=adherence_config,
+            use_amp=use_amp,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -242,6 +279,8 @@ def fit(
 
 
 def plot_loss(history):
+    import matplotlib.pyplot as plt
+
     train_loss = history["train_loss"]
     val_loss = history["val_loss"]
     epochs = range(1, len(train_loss) + 1)

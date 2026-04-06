@@ -1,6 +1,4 @@
-"""Compatibility exports for the default transformer baseline."""
-
-from .architectures import (
+from .transformer_baseline import (
     AudioEmbedding,
     AudioEncoder,
     ChartDecoder,
@@ -12,20 +10,20 @@ from .architectures import (
     build_transformer_baseline,
     generate_causal_mask,
 )
-from .factory import build_model
-from .specs import ModelSpec
+from ..registry import register_architecture
+
+
+register_architecture("transformer_baseline", build_transformer_baseline, overwrite=True)
 
 __all__ = [
     "AudioEmbedding",
     "AudioEncoder",
     "ChartDecoder",
-    "ModelSpec",
     "OutputHead",
     "PositionalEncoding",
     "TaikoTransformer",
     "TokenEmbedding",
     "TransformerBaselineConfig",
-    "build_model",
     "build_transformer_baseline",
     "generate_causal_mask",
 ]

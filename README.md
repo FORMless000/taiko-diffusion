@@ -10,7 +10,8 @@ Right now, the repository contains:
 
 - a preprocessing pipeline that parses `.osu` / `.osz` beatmaps into training-friendly JSON
 - a beat-aligned dataset builder that converts audio + notes into fixed 4-beat training sequences
-- an initial transformer baseline for token generation conditioned on beat-aligned audio features
+- a pluggable model architecture layer with a default conditioned transformer baseline
+- a portable training workflow that can start from raw `.osz` files and resume from checkpoints on another machine
 
 Diffusion is still the long-term target rather than the current implemented model.
 
@@ -58,9 +59,9 @@ The beat-aligned dataset builder writes:
 The project has moved beyond a minimal parser scaffold.
 
 - `data_preprocessing.ipynb` demonstrates parsing and reconstruction of osu!taiko charts.
-- [`beat_aligned_dataset.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/beat_aligned_dataset.ipynb) implements the full beat-aligned dataset pipeline.
-- [`otsu_Transformer.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb) implements an encoder-decoder transformer baseline for sequence prediction and sample generation.
-- The shared logic has also been moved into reusable Python modules under [`src/preprocessing`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing) and [`src/model`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model).
+- `beat_aligned_dataset.ipynb` and `otsu_Transformer.ipynb` are now legacy notebook snapshots kept for reference.
+- Shared logic now lives in reusable Python modules under `src/preprocessing`, `src/model`, and `src/training`.
+- The default architecture is still the encoder-decoder transformer baseline, but model construction now goes through a registry and `ModelSpec`.
 
 From the notebook runs currently saved in the repo:
 
@@ -102,17 +103,20 @@ Current dataset settings:
 
 ### 3. Train a transformer baseline
 
-The baseline model in [`src/model/model.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/model.py) is a transformer encoder-decoder:
+The default baseline model is a transformer encoder-decoder:
 
 - encoder input: beat-aligned audio sequence `(192, 128)`
 - decoder input: autoregressive note tokens
 - output: the next token in the chart sequence
+- conditioning: normalized difficulty, density, and beatmap id values injected into decoder token states
 
 Supporting code lives in:
 
-- [`src/model/data.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/data.py) for manifests, splits, vocabulary, dataset, and collation
-- [`src/model/trainer.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/trainer.py) for training and validation loops
-- [`src/model/generation.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/generation.py) for greedy decoding and song-level generation
+- `src/model/data.py` for manifests, splits, vocabulary, dataset, and collation
+- `src/model/model.py` and `src/model/architectures/` for architecture specs, registry-backed model construction, and the default transformer baseline
+- `src/model/trainer.py` for training and validation loops
+- `src/model/generation.py` plus `src/model/generation_components/` for sampling, cached audio preprocessing, and generation helpers
+- `src/training/` for portable run configuration, checkpointing, and raw-`.osz` training
 
 ## Quick Start
 
@@ -122,23 +126,34 @@ Supporting code lives in:
 pip install -e .
 ```
 
-2. Unpack `.osz` files:
+2. Train from raw `.osz` files into a self-contained run directory:
 
 ```bash
-python src/preprocessing/unpack_osz.py
+taiko-train sample_data/raw/2034220.osz sample_data/raw/2267904.osz \
+  --run-dir runs/demo \
+  --epochs 1 \
+  --batch-size 2
 ```
 
-3. Parse and reconstruct sample beatmaps:
+This command will:
 
-- open [`data_preprocessing.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/data_preprocessing.ipynb) and run the notebook
+- unpack the raw archives
+- parse taiko `.osu` files into JSON artifacts
+- build the beat-aligned dataset
+- build vocab and split metadata
+- train the selected architecture
+- write portable checkpoints and run metadata under the chosen run directory
 
-4. Build the beat-aligned dataset:
+3. Resume from a checkpoint:
 
-- open [`beat_aligned_dataset.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/beat_aligned_dataset.ipynb) and run the pipeline cells
+```bash
+taiko-train --run-dir runs/demo --resume-checkpoint runs/demo/checkpoints/latest.pt --epochs 2
+```
 
-5. Train or inspect the transformer baseline:
+4. Legacy notebooks:
 
-- open [`otsu_Transformer.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb)
+- `beat_aligned_dataset.ipynb` and `otsu_Transformer.ipynb` are preserved as legacy references.
+- Prefer the package modules and `taiko-train` for current workflows.
 
 ## Repository Layout
 
@@ -150,5 +165,5 @@ python src/preprocessing/unpack_osz.py
 ## Current Limitations
 
 - The current beat-aligned dataset builder only supports constant-BPM charts; charts with BPM changes are rejected during dataset creation.
-- Several notebooks and scripts still use machine-specific absolute paths and are not yet packaged as a clean end-to-end CLI workflow.
+- Legacy notebooks still exist for reference and may contain machine-specific paths.
 - The implemented model is currently a transformer baseline; diffusion training/inference is still future work.
