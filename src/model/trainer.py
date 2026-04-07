@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
+from typing import Any, Callable
 
 
 def _compute_adherence_metrics(logits, labels, density_values, difficulty_values, ts_token_ids, pad_id=0, ignore_index=0):
@@ -40,7 +41,19 @@ def _compute_adherence_metrics(logits, labels, density_values, difficulty_values
         }
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_config=None):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    adherence_config=None,
+    *,
+    metrics_logger: Callable[[dict[str, Any]], None] | None = None,
+    log_every_n_batches: int | None = None,
+    epoch: int | None = None,
+    global_step_start: int = 0,
+):
     model.train()
 
     total_loss = 0.0
@@ -57,7 +70,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
         pad_id = int(adherence_config.get("pad_id", 0))
         ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar, start=1):
         audio = batch["audio"].to(device)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -108,6 +121,24 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
         else:
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
+        if (
+            metrics_logger is not None
+            and log_every_n_batches is not None
+            and log_every_n_batches > 0
+            and batch_idx % log_every_n_batches == 0
+        ):
+            payload: dict[str, Any] = {
+                "train/loss_batch": float(loss.item()),
+                "batch": int(batch_idx),
+                "global_step": int(global_step_start + batch_idx),
+            }
+            if epoch is not None:
+                payload["epoch"] = int(epoch)
+            if metrics:
+                payload["train/density_proxy_abs_error"] = float(metrics["density_proxy_abs_error"])
+                payload["train/difficulty_proxy_drift"] = float(metrics["difficulty_proxy_drift"])
+            metrics_logger(payload)
+
     avg_loss = total_loss / total_batches
     out = {"loss": avg_loss}
     if ts_token_ids is not None and total_batches > 0:
@@ -117,7 +148,18 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, adherence_c
 
 
 @torch.no_grad()
-def validate_one_epoch(model, dataloader, criterion, device, adherence_config=None):
+def validate_one_epoch(
+    model,
+    dataloader,
+    criterion,
+    device,
+    adherence_config=None,
+    *,
+    metrics_logger: Callable[[dict[str, Any]], None] | None = None,
+    log_every_n_batches: int | None = None,
+    epoch: int | None = None,
+    global_step_start: int = 0,
+):
     model.eval()
 
     total_loss = 0.0
@@ -134,7 +176,7 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
         pad_id = int(adherence_config.get("pad_id", 0))
         ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar, start=1):
         audio = batch["audio"].to(device)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -180,6 +222,24 @@ def validate_one_epoch(model, dataloader, criterion, device, adherence_config=No
             )
         else:
             pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        if (
+            metrics_logger is not None
+            and log_every_n_batches is not None
+            and log_every_n_batches > 0
+            and batch_idx % log_every_n_batches == 0
+        ):
+            payload: dict[str, Any] = {
+                "val/loss_batch": float(loss.item()),
+                "batch": int(batch_idx),
+                "global_step": int(global_step_start + batch_idx),
+            }
+            if epoch is not None:
+                payload["epoch"] = int(epoch)
+            if metrics:
+                payload["val/density_proxy_abs_error"] = float(metrics["density_proxy_abs_error"])
+                payload["val/difficulty_proxy_drift"] = float(metrics["difficulty_proxy_drift"])
+            metrics_logger(payload)
 
     avg_loss = total_loss / total_batches
     out = {"loss": avg_loss}

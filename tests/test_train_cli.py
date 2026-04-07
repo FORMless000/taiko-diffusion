@@ -19,6 +19,33 @@ if torch is not None:
     from src.model.train_cli import main as train_main
 
 
+class _FakeWandbRun:
+    def __init__(self):
+        self.logged: list[dict[str, float | int | str]] = []
+        self.defined_metrics: list[tuple[str, str | None]] = []
+        self.finished = False
+
+    def log(self, payload):
+        self.logged.append(dict(payload))
+
+    def define_metric(self, name, step_metric=None):
+        self.defined_metrics.append((str(name), None if step_metric is None else str(step_metric)))
+
+    def finish(self):
+        self.finished = True
+
+
+class _FakeWandbModule:
+    def __init__(self):
+        self.runs: list[_FakeWandbRun] = []
+
+    def init(self, **kwargs):
+        run = _FakeWandbRun()
+        run.init_kwargs = kwargs
+        self.runs.append(run)
+        return run
+
+
 def _write_dummy_dataset(data_root: Path, num_charts: int = 10) -> None:
     audio_dir = data_root / "beat_aligned_dataset" / "audio_npz"
     token_dir = data_root / "beat_aligned_dataset" / "token_json"
@@ -56,10 +83,13 @@ class TestTrainCli(unittest.TestCase):
             data_root = Path(tmpdir)
             _write_dummy_dataset(data_root)
 
+            checkpoints_dir = data_root / "repo_checkpoints" / "context"
             rc = train_main(
                 [
                     "--data-root",
                     str(data_root),
+                    "--checkpoints-dir",
+                    str(checkpoints_dir),
                     "--epochs",
                     "1",
                     "--batch-size",
@@ -86,9 +116,10 @@ class TestTrainCli(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue((data_root / "training" / "splits.json").exists())
             self.assertTrue((data_root / "training" / "vocab.json").exists())
-            self.assertTrue((data_root / "training" / "checkpoints" / "last.ckpt").exists())
+            self.assertTrue((checkpoints_dir / "last.ckpt").exists())
+            self.assertTrue((checkpoints_dir / "best.ckpt").exists())
 
-            payload = load_checkpoint(data_root / "training" / "checkpoints" / "last.ckpt", map_location="cpu")
+            payload = load_checkpoint(checkpoints_dir / "last.ckpt", map_location="cpu")
             self.assertEqual(payload["metadata"]["epoch"], 1)
 
     def test_cli_resume_reuses_saved_vocab_and_splits(self):
@@ -99,6 +130,8 @@ class TestTrainCli(unittest.TestCase):
             first_args = [
                 "--data-root",
                 str(data_root),
+                "--checkpoints-dir",
+                str(data_root / "repo_checkpoints" / "context"),
                 "--epochs",
                 "1",
                 "--batch-size",
@@ -124,11 +157,13 @@ class TestTrainCli(unittest.TestCase):
 
             splits_before = (data_root / "training" / "splits.json").read_text(encoding="utf-8")
             vocab_before = (data_root / "training" / "vocab.json").read_text(encoding="utf-8")
-            checkpoint_path = data_root / "training" / "checkpoints" / "last.ckpt"
+            checkpoint_path = data_root / "repo_checkpoints" / "context" / "last.ckpt"
 
             second_args = [
                 "--resume-checkpoint",
                 str(checkpoint_path),
+                "--checkpoints-dir",
+                str(data_root / "repo_checkpoints" / "context"),
                 "--epochs",
                 "2",
                 "--batch-size",
@@ -144,6 +179,72 @@ class TestTrainCli(unittest.TestCase):
             self.assertEqual(payload["metadata"]["epoch"], 2)
             self.assertEqual((data_root / "training" / "splits.json").read_text(encoding="utf-8"), splits_before)
             self.assertEqual((data_root / "training" / "vocab.json").read_text(encoding="utf-8"), vocab_before)
+
+    def test_cli_wandb_logs_batch_and_epoch_metrics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir)
+            _write_dummy_dataset(data_root, num_charts=12)
+            checkpoints_dir = data_root / "repo_checkpoints" / "context"
+
+            fake_wandb = _FakeWandbModule()
+            original_wandb = sys.modules.get("wandb")
+            sys.modules["wandb"] = fake_wandb
+            try:
+                rc = train_main(
+                    [
+                        "--data-root",
+                        str(data_root),
+                        "--checkpoints-dir",
+                        str(checkpoints_dir),
+                        "--epochs",
+                        "1",
+                        "--batch-size",
+                        "2",
+                        "--lr",
+                        "0.001",
+                        "--device",
+                        "cpu",
+                        "--d-model",
+                        "16",
+                        "--nhead",
+                        "4",
+                        "--num-encoder-layers",
+                        "1",
+                        "--num-decoder-layers",
+                        "1",
+                        "--dim-feedforward",
+                        "32",
+                        "--max-len",
+                        "32",
+                        "--wandb",
+                        "--wandb-run-name",
+                        "test",
+                        "--wandb-log-every-batches",
+                        "1",
+                    ]
+                )
+            finally:
+                if original_wandb is None:
+                    sys.modules.pop("wandb", None)
+                else:
+                    sys.modules["wandb"] = original_wandb
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(fake_wandb.runs), 1)
+            run = fake_wandb.runs[0]
+            self.assertTrue(run.finished)
+            self.assertIn("project", run.init_kwargs)
+            self.assertEqual(run.init_kwargs["project"], "taiko-transformer")
+            self.assertEqual(run.init_kwargs["entity"], "yiy523-lehigh-university")
+
+            flattened_keys = {key for payload in run.logged for key in payload.keys()}
+            self.assertIn("train/loss_batch", flattened_keys)
+            self.assertIn("val/loss_batch", flattened_keys)
+            self.assertIn("train/loss_epoch", flattened_keys)
+            self.assertIn("val/loss_epoch", flattened_keys)
+            self.assertIn("optimizer/lr", flattened_keys)
+            self.assertIn("checkpoint/last_path", flattened_keys)
+            self.assertIn("checkpoint/best_updated", flattened_keys)
 
 
 if __name__ == "__main__":

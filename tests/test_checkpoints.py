@@ -1,6 +1,6 @@
 import random
-import sys
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -155,6 +155,53 @@ class TestCheckpoints(unittest.TestCase):
             self.assertEqual(restored.name, "taiko_context_transformer")
             self.assertEqual(restored.history_max_tokens, 48)
             self.assertEqual(restored.retrieval_top_k, 2)
+
+    def test_save_checkpoint_is_atomic_and_no_tmp_left(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ckpt_path = root / "atomic.ckpt"
+
+            spec = ArchitectureSpec(
+                d_model=16,
+                nhead=4,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                dim_feedforward=32,
+                max_len=32,
+            )
+            train_spec = TrainingSpec(epochs=1, batch_size=2, lr=1e-3, device="cpu")
+            model = build_model(spec, vocab_size=8)
+            optimizer = torch.optim.Adam(model.parameters(), lr=train_spec.lr)
+
+            metadata = CheckpointMetadata(
+                epoch=1,
+                global_step=1,
+                best_val_loss=1.0,
+                data_root=str(root),
+                artifact_paths={"audio_dir": "beat_aligned_dataset/audio_npz"},
+            )
+            save_checkpoint(
+                ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                architecture_spec=spec,
+                training_spec=train_spec,
+                metadata=metadata,
+                history={"train_loss": [1.0], "val_loss": [1.0], "lr": [1e-3]},
+                vocab={
+                    "vocab_list": ["PAD", "BOS", "EOS", "DON"],
+                    "token_to_id": {"PAD": 0, "BOS": 1, "EOS": 2, "DON": 3},
+                    "id_to_token": {0: "PAD", 1: "BOS", 2: "EOS", 3: "DON"},
+                },
+                split_ids={"train": ["a"], "val": ["b"], "test": ["c"]},
+                adherence_config={"pad_id": 0, "ts_token_ids": []},
+            )
+
+            self.assertTrue(ckpt_path.exists())
+            payload = load_checkpoint(ckpt_path, map_location="cpu")
+            self.assertEqual(payload["metadata"]["epoch"], 1)
+            tmp_files = list(root.glob(".atomic.ckpt.*.tmp"))
+            self.assertEqual(tmp_files, [])
 
 
 if __name__ == "__main__":

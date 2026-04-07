@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import random
@@ -22,6 +23,8 @@ from .data import (
 from .factory import build_model
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
+
+_ARTIFACT_ABS_PREFIX = "ABS::"
 
 
 def _default_device() -> str:
@@ -49,7 +52,22 @@ def _relative_to_root(path: Path, data_root: Path) -> str:
     return str(path.resolve().relative_to(data_root.resolve()))
 
 
-def _artifact_paths_for_root(data_root: Path) -> dict[str, Path]:
+def _serialize_artifact_path(path: Path, data_root: Path) -> str:
+    resolved = path.resolve()
+    root_resolved = data_root.resolve()
+    try:
+        return str(resolved.relative_to(root_resolved))
+    except ValueError:
+        return f"{_ARTIFACT_ABS_PREFIX}{resolved}"
+
+
+def _deserialize_artifact_path(path_value: str, data_root: Path) -> Path:
+    if path_value.startswith(_ARTIFACT_ABS_PREFIX):
+        return Path(path_value[len(_ARTIFACT_ABS_PREFIX):]).resolve()
+    return (data_root / path_value).resolve()
+
+
+def _artifact_paths_for_root(data_root: Path, checkpoints_dir: Path | None = None) -> dict[str, Path]:
     training_dir = data_root / "training"
     return {
         "audio_dir": data_root / "beat_aligned_dataset" / "audio_npz",
@@ -58,12 +76,12 @@ def _artifact_paths_for_root(data_root: Path) -> dict[str, Path]:
         "sequence_metadata_csv": data_root / "beat_aligned_dataset" / "sequence_metadata.csv",
         "splits_json": training_dir / "splits.json",
         "vocab_json": training_dir / "vocab.json",
-        "checkpoints_dir": training_dir / "checkpoints",
+        "checkpoints_dir": checkpoints_dir.resolve() if checkpoints_dir is not None else (training_dir / "checkpoints"),
     }
 
 
 def _artifact_paths_to_relative(artifact_paths: dict[str, Path], data_root: Path) -> dict[str, str]:
-    return {key: _relative_to_root(path, data_root) for key, path in artifact_paths.items()}
+    return {key: _serialize_artifact_path(path, data_root) for key, path in artifact_paths.items()}
 
 
 def _artifact_paths_from_checkpoint(data_root: Path, checkpoint_payload: dict[str, Any] | None) -> dict[str, Path]:
@@ -74,10 +92,34 @@ def _artifact_paths_from_checkpoint(data_root: Path, checkpoint_payload: dict[st
     if not metadata.artifact_paths:
         return _artifact_paths_for_root(data_root)
 
-    return {
-        key: (data_root / relative_path).resolve()
-        for key, relative_path in metadata.artifact_paths.items()
-    }
+    return {key: _deserialize_artifact_path(path_value, data_root) for key, path_value in metadata.artifact_paths.items()}
+
+
+def _build_wandb_logger(args: argparse.Namespace, architecture_spec: ArchitectureSpec):
+    if not args.wandb:
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("wandb logging requested, but `wandb` is not installed. Install it with `pip install wandb`.") from exc
+
+    modelname = architecture_spec.name
+    runname = args.wandb_run_name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    run = wandb.init(
+        project="taiko-transformer",
+        name=f" taiko-transformer_run_{modelname}_{runname}_{timestamp}",
+        entity="yiy523-lehigh-university",
+    )
+    if hasattr(run, "define_metric"):
+        run.define_metric("global_step")
+        run.define_metric("*", step_metric="global_step")
+    else:
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
+    return run
 
 
 def _resolve_data_root(args: argparse.Namespace, checkpoint_payload: dict[str, Any] | None) -> Path:
@@ -260,6 +302,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("raw_osz", nargs="*", help="Raw .osz files, directories, or glob patterns.")
     parser.add_argument("--data-root", help="Dataset root containing unpacked and beat-aligned artifacts.")
     parser.add_argument("--resume-checkpoint", help="Resume training from a saved checkpoint.")
+    parser.add_argument("--checkpoints-dir", help="Optional checkpoint output directory override.")
     parser.add_argument("--epochs", type=int, default=50, help="Total number of epochs to train to.")
     parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
@@ -284,6 +327,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retrieval-max-tokens-per-window", type=int, default=64, help="Maximum retrieved tokens to prepend for each prior window.")
     parser.add_argument("--retrieval-exclude-last-n-windows", type=int, default=2, help="Skip the most recent windows when retrieving repeated motifs.")
     parser.add_argument("--use-motif-retrieval", action=argparse.BooleanOptionalAction, default=True, help="Enable audio-similarity motif retrieval for the context transformer.")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb-run-name", default="default", help="Run-name tag used in the W&B run name.")
+    parser.add_argument("--wandb-log-every-batches", type=int, default=100, help="Log batch metrics to W&B every N batches.")
     return parser
 
 
@@ -296,7 +342,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_payload = load_checkpoint(args.resume_checkpoint, map_location="cpu")
 
     data_root = _resolve_data_root(args, checkpoint_payload)
+    checkpoints_override = Path(args.checkpoints_dir).resolve() if args.checkpoints_dir else None
     artifact_paths = _artifact_paths_from_checkpoint(data_root, checkpoint_payload)
+    if checkpoint_payload is None:
+        artifact_paths = _artifact_paths_for_root(data_root, checkpoints_dir=checkpoints_override)
+    elif checkpoints_override is not None:
+        artifact_paths["checkpoints_dir"] = checkpoints_override
 
     if args.raw_osz:
         from src.preprocessing.prepare_training_data import prepare_training_data
@@ -343,6 +394,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     pad_id = int(token_to_id["PAD"])
     architecture_spec = _build_architecture_spec(args, checkpoint_payload)
+    wandb_run = _build_wandb_logger(args, architecture_spec)
+    metrics_logger = wandb_run.log if wandb_run is not None else None
 
     train_dataset, collate, label_ignore_index = build_dataset_for_spec(
         train_seq_index,
@@ -414,6 +467,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Checkpoint already at epoch {start_epoch - 1}, which is >= requested total epochs {training_spec.epochs}. "
             "Nothing to do."
         )
+        if wandb_run is not None:
+            wandb_run.finish()
         return 0
 
     for epoch in range(start_epoch, training_spec.epochs + 1):
@@ -424,6 +479,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             criterion=criterion,
             device=device,
             adherence_config=adherence_config,
+            metrics_logger=metrics_logger,
+            log_every_n_batches=args.wandb_log_every_batches,
+            epoch=epoch,
+            global_step_start=global_step,
         )
         val_stats = validate_one_epoch(
             model=model,
@@ -431,6 +490,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             criterion=criterion,
             device=device,
             adherence_config=adherence_config,
+            metrics_logger=metrics_logger,
+            log_every_n_batches=args.wandb_log_every_batches,
+            epoch=epoch,
+            global_step_start=global_step + len(train_loader),
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -472,8 +535,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             adherence_config=adherence_config,
         )
 
+        best_updated = False
         if best_val_loss is None or val_stats["loss"] < best_val_loss:
             best_val_loss = float(val_stats["loss"])
+            best_updated = True
             best_metadata = CheckpointMetadata(
                 epoch=epoch,
                 global_step=global_step,
@@ -494,6 +559,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 split_ids=split_ids,
                 adherence_config=adherence_config,
             )
+
+        if metrics_logger is not None:
+            epoch_payload: dict[str, Any] = {
+                "epoch": int(epoch),
+                "global_step": int(global_step),
+                "train/loss_epoch": float(train_stats["loss"]),
+                "val/loss_epoch": float(val_stats["loss"]),
+                "optimizer/lr": float(current_lr),
+                "checkpoint/last_path": str((checkpoints_dir / "last.ckpt").resolve()),
+                "checkpoint/best_updated": int(best_updated),
+            }
+            if "density_proxy_abs_error" in train_stats:
+                epoch_payload["train/density_proxy_abs_error"] = float(train_stats["density_proxy_abs_error"])
+                epoch_payload["val/density_proxy_abs_error"] = float(val_stats["density_proxy_abs_error"])
+                epoch_payload["train/difficulty_proxy_drift"] = float(train_stats["difficulty_proxy_drift"])
+                epoch_payload["val/difficulty_proxy_drift"] = float(val_stats["difficulty_proxy_drift"])
+            metrics_logger(epoch_payload)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
     return 0
 

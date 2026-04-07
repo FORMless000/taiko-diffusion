@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
 from pathlib import Path
 import random
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -91,7 +93,19 @@ def save_checkpoint(
         "rng_state": capture_rng_states(),
     }
 
-    torch.save(payload, checkpoint_path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{checkpoint_path.name}.",
+        suffix=".tmp",
+        dir=str(checkpoint_path.parent),
+    )
+    os.close(fd)
+    tmp_checkpoint_path = Path(tmp_path)
+    try:
+        torch.save(payload, tmp_checkpoint_path)
+        os.replace(tmp_checkpoint_path, checkpoint_path)
+    finally:
+        if tmp_checkpoint_path.exists():
+            tmp_checkpoint_path.unlink()
     return checkpoint_path
 
 

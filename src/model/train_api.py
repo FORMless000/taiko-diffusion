@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import random
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -25,6 +25,8 @@ from .data import (
 from .factory import build_model
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
+
+_ARTIFACT_ABS_PREFIX = "ABS::"
 
 
 @dataclass
@@ -98,6 +100,21 @@ def _relative_to_root(path: Path, data_root: Path) -> str:
     return str(path.resolve().relative_to(data_root.resolve()))
 
 
+def _serialize_artifact_path(path: Path, data_root: Path) -> str:
+    resolved = path.resolve()
+    root_resolved = data_root.resolve()
+    try:
+        return str(resolved.relative_to(root_resolved))
+    except ValueError:
+        return f"{_ARTIFACT_ABS_PREFIX}{resolved}"
+
+
+def _deserialize_artifact_path(path_value: str, data_root: Path) -> Path:
+    if path_value.startswith(_ARTIFACT_ABS_PREFIX):
+        return Path(path_value[len(_ARTIFACT_ABS_PREFIX):]).resolve()
+    return (data_root / path_value).resolve()
+
+
 def _build_history_template() -> dict[str, list[float]]:
     return {
         "train_loss": [],
@@ -122,9 +139,10 @@ def _append_history(history: dict[str, list[float]], train_stats: dict[str, Any]
         history["val_difficulty_proxy_drift"].append(float(val_stats["difficulty_proxy_drift"]))
 
 
-def build_training_artifacts(data_root: str | Path) -> TrainingArtifacts:
+def build_training_artifacts(data_root: str | Path, checkpoints_dir: str | Path | None = None) -> TrainingArtifacts:
     data_root = Path(data_root).resolve()
     training_dir = data_root / "training"
+    resolved_checkpoints_dir = Path(checkpoints_dir).resolve() if checkpoints_dir is not None else (training_dir / "checkpoints")
     return TrainingArtifacts(
         data_root=data_root,
         audio_dir=data_root / "beat_aligned_dataset" / "audio_npz",
@@ -134,7 +152,7 @@ def build_training_artifacts(data_root: str | Path) -> TrainingArtifacts:
         training_dir=training_dir,
         splits_json=training_dir / "splits.json",
         vocab_json=training_dir / "vocab.json",
-        checkpoints_dir=training_dir / "checkpoints",
+        checkpoints_dir=resolved_checkpoints_dir,
     )
 
 
@@ -295,8 +313,9 @@ def create_training_context(
     data_root: str | Path,
     architecture_spec: ArchitectureSpec | None = None,
     training_spec: TrainingSpec | None = None,
+    checkpoints_dir: str | Path | None = None,
 ) -> TrainingContext:
-    artifacts = build_training_artifacts(data_root)
+    artifacts = build_training_artifacts(data_root, checkpoints_dir=checkpoints_dir)
     architecture_spec = architecture_spec or ArchitectureSpec()
     training_spec = training_spec or TrainingSpec(device=_default_device())
 
@@ -338,6 +357,7 @@ def load_training_context_from_checkpoint(
     device: str | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
+    checkpoints_dir: str | Path | None = None,
 ) -> TrainingContext:
     checkpoint_path = Path(checkpoint_path).resolve()
     payload = load_checkpoint(checkpoint_path, map_location="cpu")
@@ -354,10 +374,19 @@ def load_training_context_from_checkpoint(
     if num_workers is not None:
         training_spec.num_workers = num_workers
 
+    resolved_checkpoints_dir = None
+    if checkpoints_dir is not None:
+        resolved_checkpoints_dir = Path(checkpoints_dir).resolve()
+    else:
+        checkpoints_serialized = metadata.artifact_paths.get("checkpoints_dir")
+        if checkpoints_serialized:
+            resolved_checkpoints_dir = _deserialize_artifact_path(checkpoints_serialized, resolved_data_root)
+
     context = create_training_context(
         data_root=resolved_data_root,
         architecture_spec=architecture_spec,
         training_spec=training_spec,
+        checkpoints_dir=resolved_checkpoints_dir,
     )
 
     context.model.load_state_dict(payload["model_state_dict"])
@@ -381,6 +410,8 @@ def train_context(
     context: TrainingContext,
     *,
     epochs: int | None = None,
+    metrics_logger: Callable[[dict[str, Any]], None] | None = None,
+    log_every_n_batches: int | None = None,
 ) -> TrainingContext:
     target_epochs = context.training_spec.epochs if epochs is None else int(epochs)
     context.training_spec.epochs = target_epochs
@@ -393,6 +424,10 @@ def train_context(
             criterion=context.criterion,
             device=torch.device(context.training_spec.device),
             adherence_config=context.dataset.adherence_config,
+            metrics_logger=metrics_logger,
+            log_every_n_batches=log_every_n_batches,
+            epoch=epoch,
+            global_step_start=context.global_step,
         )
         val_stats = validate_one_epoch(
             model=context.model,
@@ -400,6 +435,10 @@ def train_context(
             criterion=context.criterion,
             device=torch.device(context.training_spec.device),
             adherence_config=context.dataset.adherence_config,
+            metrics_logger=metrics_logger,
+            log_every_n_batches=log_every_n_batches,
+            epoch=epoch,
+            global_step_start=context.global_step + len(context.dataset.train_loader),
         )
 
         current_lr = context.optimizer.param_groups[0]["lr"]
@@ -424,7 +463,7 @@ def train_context(
                 "sequence_metadata_csv": _relative_to_root(context.artifacts.sequence_metadata_csv, context.artifacts.data_root),
                 "splits_json": _relative_to_root(context.artifacts.splits_json, context.artifacts.data_root),
                 "vocab_json": _relative_to_root(context.artifacts.vocab_json, context.artifacts.data_root),
-                "checkpoints_dir": _relative_to_root(context.artifacts.checkpoints_dir, context.artifacts.data_root),
+                "checkpoints_dir": _serialize_artifact_path(context.artifacts.checkpoints_dir, context.artifacts.data_root),
             },
         )
 
@@ -442,8 +481,10 @@ def train_context(
             adherence_config=context.dataset.adherence_config,
         )
 
+        best_updated = False
         if context.best_val_loss is None or val_stats["loss"] < context.best_val_loss:
             context.best_val_loss = float(val_stats["loss"])
+            best_updated = True
             best_metadata = CheckpointMetadata(
                 epoch=epoch,
                 global_step=context.global_step,
@@ -464,6 +505,23 @@ def train_context(
                 split_ids=context.dataset.split_ids,
                 adherence_config=context.dataset.adherence_config,
             )
+
+        if metrics_logger is not None:
+            payload: dict[str, Any] = {
+                "epoch": int(epoch),
+                "global_step": int(context.global_step),
+                "train/loss_epoch": float(train_stats["loss"]),
+                "val/loss_epoch": float(val_stats["loss"]),
+                "optimizer/lr": float(current_lr),
+                "checkpoint/last_path": str((context.artifacts.checkpoints_dir / "last.ckpt").resolve()),
+                "checkpoint/best_updated": int(best_updated),
+            }
+            if "density_proxy_abs_error" in train_stats:
+                payload["train/density_proxy_abs_error"] = float(train_stats["density_proxy_abs_error"])
+                payload["val/density_proxy_abs_error"] = float(val_stats["density_proxy_abs_error"])
+                payload["train/difficulty_proxy_drift"] = float(train_stats["difficulty_proxy_drift"])
+                payload["val/difficulty_proxy_drift"] = float(val_stats["difficulty_proxy_drift"])
+            metrics_logger(payload)
 
         context.start_epoch = epoch + 1
 
