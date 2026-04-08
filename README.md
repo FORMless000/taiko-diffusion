@@ -140,6 +140,34 @@ python src/preprocessing/unpack_osz.py
 
 - open [`otsu_Transformer.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb)
 
+## W&B Setup
+
+For notebook and CLI logging without interactive prompts:
+
+1. Install dependencies:
+
+```bash
+pip install -e .
+```
+
+Optional W&B support:
+
+```bash
+pip install -e .[wandb]
+```
+
+2. Configure W&B environment variables (copy from `.env.wandb.example`):
+
+```bash
+set WANDB_API_KEY=your_key_here
+set WANDB_NOTEBOOK_NAME=train_context_raw_data.ipynb
+set WANDB_DIR=.wandb
+```
+
+You can also pass API key directly by parameter (no environment setup), e.g. `--wandb-api-key <key>` in training CLI.
+
+3. Use [`wandb_debug.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/wandb_debug.ipynb) to verify setup before long training runs.
+
 ## Repository Layout
 
 - [`src/preprocessing`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing): unpacking, parsing, reconstruction, and beat-aligned dataset building

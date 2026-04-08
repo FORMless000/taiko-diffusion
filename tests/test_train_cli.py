@@ -38,12 +38,17 @@ class _FakeWandbRun:
 class _FakeWandbModule:
     def __init__(self):
         self.runs: list[_FakeWandbRun] = []
+        self.login_calls: list[dict] = []
 
     def init(self, **kwargs):
         run = _FakeWandbRun()
         run.init_kwargs = kwargs
         self.runs.append(run)
         return run
+
+    def login(self, **kwargs):
+        self.login_calls.append(dict(kwargs))
+        return True
 
 
 def _write_dummy_dataset(data_root: Path, num_charts: int = 10) -> None:
@@ -78,6 +83,52 @@ def _write_dummy_dataset(data_root: Path, num_charts: int = 10) -> None:
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class TestTrainCli(unittest.TestCase):
+    def test_cli_without_wandb_does_not_import_wandb_module(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir)
+            _write_dummy_dataset(data_root)
+            checkpoints_dir = data_root / "repo_checkpoints" / "context"
+
+            original_wandb = sys.modules.get("wandb")
+            sys.modules["wandb"] = None
+            try:
+                rc = train_main(
+                    [
+                        "--data-root",
+                        str(data_root),
+                        "--checkpoints-dir",
+                        str(checkpoints_dir),
+                        "--epochs",
+                        "1",
+                        "--batch-size",
+                        "2",
+                        "--lr",
+                        "0.001",
+                        "--device",
+                        "cpu",
+                        "--d-model",
+                        "16",
+                        "--nhead",
+                        "4",
+                        "--num-encoder-layers",
+                        "1",
+                        "--num-decoder-layers",
+                        "1",
+                        "--dim-feedforward",
+                        "32",
+                        "--max-len",
+                        "32",
+                    ]
+                )
+            finally:
+                if original_wandb is None:
+                    sys.modules.pop("wandb", None)
+                else:
+                    sys.modules["wandb"] = original_wandb
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((checkpoints_dir / "last.ckpt").exists())
+
     def test_cli_smoke_run_writes_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_root = Path(tmpdir)
@@ -217,6 +268,10 @@ class TestTrainCli(unittest.TestCase):
                         "--max-len",
                         "32",
                         "--wandb",
+                        "--wandb-api-key",
+                        "test-key",
+                        "--wandb-notebook-name",
+                        "test_train_cli.ipynb",
                         "--wandb-run-name",
                         "test",
                         "--wandb-log-every-batches",
@@ -236,6 +291,7 @@ class TestTrainCli(unittest.TestCase):
             self.assertIn("project", run.init_kwargs)
             self.assertEqual(run.init_kwargs["project"], "taiko-transformer")
             self.assertEqual(run.init_kwargs["entity"], "yiy523-lehigh-university")
+            self.assertEqual(len(fake_wandb.login_calls), 1)
 
             flattened_keys = {key for payload in run.logged for key in payload.keys()}
             self.assertIn("train/loss_batch", flattened_keys)

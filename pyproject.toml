@@ -20,3 +20,8 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+[project.optional-dependencies]
+wandb = [
+  "wandb>=0.17.0",
+]

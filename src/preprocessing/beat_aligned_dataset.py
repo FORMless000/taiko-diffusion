@@ -109,6 +109,16 @@ class NotesInfo:
     event_type_counts: Dict[str, int]
 
 
+class ChartBuildError(ValueError):
+    """Structured chart-processing error with type and optional diagnostics."""
+
+    def __init__(self, error_type: str, error_detail: str, diagnostics: Optional[Dict[str, Any]] = None):
+        self.error_type = str(error_type)
+        self.error_detail = str(error_detail)
+        self.diagnostics = dict(diagnostics or {})
+        super().__init__(self.error_detail)
+
+
 # ============================================================================
 # Utility helpers
 # ============================================================================
@@ -156,6 +166,53 @@ def require_file(path: Path, label: str) -> None:
     """Raise a clear error if a required file is missing."""
     if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def _timing_diagnostics_from_timing_points(timing_points: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    bpm_points = [tp for tp in timing_points if int(tp.get("uninherited", 0)) == 1]
+    unique_ms_per_beat = sorted({round(float(tp["ms_per_beat"]), 10) for tp in bpm_points}) if bpm_points else []
+    preview_values = "|".join(str(v) for v in unique_ms_per_beat[:8])
+    return {
+        "n_bpm_points": int(len(bpm_points)),
+        "unique_uninherited_mpb_count": int(len(unique_ms_per_beat)),
+        "unique_uninherited_mpb_preview": preview_values,
+    }
+
+
+def extract_timing_diagnostics(timing_path: Path) -> Dict[str, Any]:
+    try:
+        with open(timing_path, "r", encoding="utf-8") as f:
+            timing_data = json.load(f)
+        timing_points = timing_data.get("timing_points", [])
+        if not isinstance(timing_points, list):
+            return {}
+        return _timing_diagnostics_from_timing_points(timing_points)
+    except Exception:
+        return {}
+
+
+def classify_processing_error(exc: Exception) -> Tuple[str, str]:
+    if isinstance(exc, ChartBuildError):
+        return exc.error_type, exc.error_detail
+
+    detail = str(exc)
+    if "Non-constant BPM detected" in detail:
+        return "non_constant_bpm", detail
+    if "No BPM timing points found" in detail:
+        return "no_bpm_points", detail
+    if "No timing_points found" in detail:
+        return "timing_points_missing", detail
+    if "off-grid model notes" in detail:
+        return "off_grid_notes", detail
+    if "outside frame grid" in detail:
+        return "outside_grid_notes", detail
+    if "collision frames" in detail:
+        return "collision_frames", detail
+    if "No modeling events found" in detail:
+        return "no_model_events", detail
+    if "No full 4-beat sequences available" in detail:
+        return "no_sequences", detail
+    return "chart_processing_error", detail
 
 
 def normalize_song_text(text: Any) -> str:
@@ -427,17 +484,38 @@ def get_timing_info(timing_path: Path) -> TimingInfo:
 
     timing_points = timing_data.get("timing_points", [])
     if not timing_points:
-        raise ValueError("No timing_points found")
+        raise ChartBuildError(
+            "timing_points_missing",
+            "No timing_points found",
+            diagnostics={
+                "n_bpm_points": 0,
+                "unique_uninherited_mpb_count": 0,
+                "unique_uninherited_mpb_preview": "",
+            },
+        )
 
     bpm_points = [tp for tp in timing_points if int(tp.get("uninherited", 0)) == 1]
     if not bpm_points:
-        raise ValueError("No BPM timing points found (uninherited=1)")
+        raise ChartBuildError(
+            "no_bpm_points",
+            "No BPM timing points found (uninherited=1)",
+            diagnostics={
+                "n_bpm_points": 0,
+                "unique_uninherited_mpb_count": 0,
+                "unique_uninherited_mpb_preview": "",
+            },
+        )
 
     bpm_points = sorted(bpm_points, key=lambda x: float(x["offset"]))
     unique_ms_per_beat = sorted({round(float(tp["ms_per_beat"]), 10) for tp in bpm_points})
 
     if len(unique_ms_per_beat) != 1:
-        raise ValueError(f"Non-constant BPM detected: {unique_ms_per_beat}")
+        diagnostics = _timing_diagnostics_from_timing_points(timing_points)
+        raise ChartBuildError(
+            "non_constant_bpm",
+            f"Non-constant BPM detected: {unique_ms_per_beat}",
+            diagnostics=diagnostics,
+        )
 
     beat_duration_ms = float(bpm_points[0]["ms_per_beat"])
     offset_ms = float(bpm_points[0]["offset"])
@@ -853,22 +931,26 @@ def process_one_chart_row(
     )
 
     if notes_info.model_events == 0:
-        raise ValueError("No modeling events found after filtering event types")
+        raise ChartBuildError("no_model_events", "No modeling events found after filtering event types")
     if reject_offgrid_notes:
         tolerance_with_epsilon = offgrid_tolerance_ms + 1e-9
         offgrid_df = model_df[model_df["offgrid_abs_error_ms"] > tolerance_with_epsilon]
         if not offgrid_df.empty:
             max_deviation_ms = float(offgrid_df["offgrid_abs_error_ms"].max())
-            raise ValueError(
+            raise ChartBuildError(
+                "off_grid_notes",
                 f"Found {len(offgrid_df)} off-grid model notes (> {offgrid_tolerance_ms:.3f} ms); "
-                f"max deviation={max_deviation_ms:.3f} ms"
+                f"max deviation={max_deviation_ms:.3f} ms",
             )
     if notes_info.outside_event_count > 0:
-        raise ValueError(f"Found {notes_info.outside_event_count} note events outside frame grid")
+        raise ChartBuildError(
+            "outside_grid_notes",
+            f"Found {notes_info.outside_event_count} note events outside frame grid",
+        )
     if notes_info.collision_frame_count > 0:
-        raise ValueError(f"Found {notes_info.collision_frame_count} collision frames")
+        raise ChartBuildError("collision_frames", f"Found {notes_info.collision_frame_count} collision frames")
     if beat_grid_info.total_sequences == 0:
-        raise ValueError("No full 4-beat sequences available")
+        raise ChartBuildError("no_sequences", "No full 4-beat sequences available")
 
     frame_times_ms = build_beat_aligned_frame_timeline(
         timing_info.offset_ms,
@@ -943,6 +1025,8 @@ def process_one_chart_row(
         "difficulty": metadata.get("difficulty", "") or metadata_block.get("Version", ""),
         "mode": metadata.get("mode", "") or metadata.get("general", {}).get("Mode", ""),
         "status": "ok",
+        "error_type": "",
+        "error_detail": "",
         "error_message": "",
         "audio_path": str(audio_path),
         "notes_path": str(notes_path),
@@ -963,11 +1047,65 @@ def process_one_chart_row(
         "collision_frame_count": notes_info.collision_frame_count,
         "unknown_event_types": "|".join(notes_info.unknown_event_types),
         "audio_sequences_shape": str(tuple(audio_sequences.shape)),
+        "n_bpm_points": timing_info.n_bpm_points,
+        "unique_uninherited_mpb_count": 1,
+        "unique_uninherited_mpb_preview": str(round(timing_info.beat_duration_ms, 10)),
     }
     return {
         "summary": summary,
         "sequence_metadata": sequence_metadata,
     }
+
+
+def load_existing_chart_summary_cache(chart_summary_csv: Path) -> Dict[str, Dict[str, Any]]:
+    cache: Dict[str, Dict[str, Any]] = {}
+    if not chart_summary_csv.exists():
+        return cache
+
+    try:
+        chart_summary_df = pd.read_csv(chart_summary_csv)
+    except Exception as exc:
+        logging.warning("Could not read existing chart summary cache (%s): %s", chart_summary_csv, exc)
+        return cache
+
+    if "chart_id" not in chart_summary_df.columns:
+        return cache
+
+    for row in chart_summary_df.to_dict(orient="records"):
+        chart_id = str(row.get("chart_id", "")).strip()
+        if not chart_id:
+            continue
+        row.setdefault("status", "ok")
+        row.setdefault("error_type", "")
+        row.setdefault("error_detail", "")
+        row.setdefault("error_message", "")
+        row.setdefault("n_bpm_points", np.nan)
+        row.setdefault("unique_uninherited_mpb_count", np.nan)
+        row.setdefault("unique_uninherited_mpb_preview", "")
+        cache[chart_id] = row
+    return cache
+
+
+def load_existing_sequence_metadata_cache(sequence_metadata_csv: Path) -> Dict[str, List[Dict[str, Any]]]:
+    cache: Dict[str, List[Dict[str, Any]]] = {}
+    if not sequence_metadata_csv.exists():
+        return cache
+
+    try:
+        sequence_metadata_df = pd.read_csv(sequence_metadata_csv)
+    except Exception as exc:
+        logging.warning("Could not read existing sequence metadata cache (%s): %s", sequence_metadata_csv, exc)
+        return cache
+
+    if "chart_id" not in sequence_metadata_df.columns:
+        return cache
+
+    for row in sequence_metadata_df.to_dict(orient="records"):
+        chart_id = str(row.get("chart_id", "")).strip()
+        if not chart_id:
+            continue
+        cache.setdefault(chart_id, []).append(row)
+    return cache
 
 
 # ============================================================================
@@ -982,6 +1120,7 @@ def run_pipeline(
     reject_offgrid_notes: bool = True,
     offgrid_tolerance_ms: float = 5.0,
     keep_only_max_notes_per_song: bool = False,
+    overwrite_dataset_outputs: bool = False,
 ) -> None:
     """
     End-to-end execution:
@@ -992,6 +1131,10 @@ def run_pipeline(
     """
     ensure_dir(index_dir)
     ensure_dir(dataset_dir)
+    audio_npz_dir = dataset_dir / "audio_npz"
+    token_json_dir = dataset_dir / "token_json"
+    ensure_dir(audio_npz_dir)
+    ensure_dir(token_json_dir)
 
     logging.info("Building internal chart mapping table...")
     mapping_df, issues_df = build_chart_mapping_table(unpacked_root)
@@ -1017,14 +1160,36 @@ def run_pipeline(
         if mapping_df.empty:
             raise RuntimeError("No charts remain after song-level max-note filtering")
 
+    chart_summary_csv = index_dir / "chart_build_summary.csv"
+    sequence_metadata_csv = dataset_dir / "sequence_metadata.csv"
+    existing_summary_cache = load_existing_chart_summary_cache(chart_summary_csv)
+    existing_sequence_cache = load_existing_sequence_metadata_cache(sequence_metadata_csv)
+
     chart_summaries: List[Dict[str, Any]] = []
     sequence_metadata_rows: List[Dict[str, Any]] = []
+    processed_count = 0
+    cached_skipped_count = 0
+    failed_count = 0
 
     total_rows = len(mapping_df)
     for i, (_, row) in enumerate(mapping_df.iterrows(), start=1):
         chart_label = f"folder_id={row['folder_id']} | chart={row['chart_base']}"
         if i == 1 or i == total_rows or i % 20 == 0:
             logging.info("Processing %d / %d | %s", i, total_rows, chart_label)
+
+        chart_id = chart_uid(row["folder_id"], row["chart_base"])
+        audio_npz_path = audio_npz_dir / f"{chart_id}.npz"
+        token_json_path = token_json_dir / f"{chart_id}.json"
+
+        if not overwrite_dataset_outputs and audio_npz_path.exists() and token_json_path.exists():
+            cached_summary = existing_summary_cache.get(chart_id)
+            cached_sequences = existing_sequence_cache.get(chart_id, [])
+            cached_status = str(cached_summary.get("status", "")).strip().lower() if cached_summary else ""
+            if cached_summary is not None and cached_status == "ok" and cached_sequences:
+                chart_summaries.append(cached_summary)
+                sequence_metadata_rows.extend(cached_sequences)
+                cached_skipped_count += 1
+                continue
 
         try:
             result = process_one_chart_row(
@@ -1035,28 +1200,39 @@ def run_pipeline(
             )
             chart_summaries.append(result["summary"])
             sequence_metadata_rows.extend(result["sequence_metadata"])
+            processed_count += 1
         except Exception as exc:
             logging.error("Failed on %s | %s", chart_label, exc)
+            error_type, error_detail = classify_processing_error(exc)
+            timing_diagnostics = (
+                dict(exc.diagnostics)
+                if isinstance(exc, ChartBuildError)
+                else extract_timing_diagnostics(Path(row["timing_path"]))
+            )
             chart_summaries.append(
                 {
-                    "chart_id": chart_uid(row["folder_id"], row["chart_base"]),
+                    "chart_id": chart_id,
                     "folder_id": row["folder_id"],
                     "chart_base": row["chart_base"],
                     "status": "error",
-                    "error_message": str(exc),
+                    "error_type": error_type,
+                    "error_detail": error_detail,
+                    "error_message": error_detail,
                     "audio_path": row["audio_path"],
                     "notes_path": row["notes_path"],
                     "timing_path": row["timing_path"],
                     "metadata_path": row["metadata_path"],
+                    "n_bpm_points": timing_diagnostics.get("n_bpm_points", np.nan),
+                    "unique_uninherited_mpb_count": timing_diagnostics.get("unique_uninherited_mpb_count", np.nan),
+                    "unique_uninherited_mpb_preview": timing_diagnostics.get("unique_uninherited_mpb_preview", ""),
                 }
             )
+            failed_count += 1
             continue
 
     chart_summary_df = pd.DataFrame(chart_summaries)
     sequence_metadata_df = pd.DataFrame(sequence_metadata_rows)
 
-    chart_summary_csv = index_dir / "chart_build_summary.csv"
-    sequence_metadata_csv = dataset_dir / "sequence_metadata.csv"
     chart_summary_df.to_csv(chart_summary_csv, index=False, encoding="utf-8-sig")
     sequence_metadata_df.to_csv(sequence_metadata_csv, index=False, encoding="utf-8-sig")
 
@@ -1064,6 +1240,9 @@ def run_pipeline(
     error_count = int((chart_summary_df["status"] == "error").sum()) if not chart_summary_df.empty else 0
 
     logging.info("Pipeline finished")
+    logging.info("Charts processed (newly built): %d", processed_count)
+    logging.info("Charts cached (skipped rebuild): %d", cached_skipped_count)
+    logging.info("Charts failed this run: %d", failed_count)
     logging.info("Charts succeeded: %d", ok_count)
     logging.info("Charts failed: %d", error_count)
     logging.info("Mapping CSV saved to: %s", mapping_csv)

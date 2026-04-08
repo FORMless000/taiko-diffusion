@@ -1,0 +1,6 @@
+2026-04-08 00:17:17,439 INFO    MainThread:59356 [wandb_init.py:setup_run_log_directory():717] Logging user logs to C:\Users\28548\PythonNotebooks\taiko-diffusion\.wandb\wandb\run-20260408_001717-c0u6qgql\logs\debug.log
+2026-04-08 00:17:17,439 INFO    MainThread:59356 [wandb_init.py:setup_run_log_directory():718] Logging internal logs to C:\Users\28548\PythonNotebooks\taiko-diffusion\.wandb\wandb\run-20260408_001717-c0u6qgql\logs\debug-internal.log
+2026-04-08 00:17:17,439 INFO    MainThread:59356 [wandb_init.py:init():844] calling init triggers
+2026-04-08 00:17:17,439 INFO    MainThread:59356 [wandb_init.py:init():849] wandb.init called with sweep_config: {}
+config: {'_wandb': {}}
+2026-04-08 00:17:17,439 INFO    MainThread:59356 [wandb_init.py:init():892] starting backend

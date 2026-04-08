@@ -62,6 +62,11 @@ from .trainer import (
     fit,
     plot_loss,
 )
+from .wandb_utils import (
+    WandbConfig,
+    WandbRuntime,
+    setup_wandb_runtime,
+)
 
 try:
     from .generation import (
@@ -123,6 +128,9 @@ __all__ = [
     "validate_one_epoch",
     "fit",
     "plot_loss",
+    "WandbConfig",
+    "WandbRuntime",
+    "setup_wandb_runtime",
 ]
 
 if SamplingConfig is not None:

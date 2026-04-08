@@ -25,6 +25,7 @@ from .data import (
 from .factory import build_model
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
+from .wandb_utils import WandbConfig, setup_wandb_runtime
 
 _ARTIFACT_ABS_PREFIX = "ABS::"
 
@@ -162,6 +163,7 @@ def prepare_sample_data_artifacts(
     *,
     overwrite_unpack: bool = False,
     overwrite_parsed: bool = False,
+    overwrite_dataset_outputs: bool = False,
     reject_offgrid_notes: bool = True,
     offgrid_tolerance_ms: float = 5.0,
     keep_only_max_notes_per_song: bool = False,
@@ -171,6 +173,7 @@ def prepare_sample_data_artifacts(
         data_root=data_root,
         overwrite_unpack=overwrite_unpack,
         overwrite_parsed=overwrite_parsed,
+        overwrite_dataset_outputs=overwrite_dataset_outputs,
         reject_offgrid_notes=reject_offgrid_notes,
         offgrid_tolerance_ms=offgrid_tolerance_ms,
         keep_only_max_notes_per_song=keep_only_max_notes_per_song,
@@ -412,117 +415,130 @@ def train_context(
     epochs: int | None = None,
     metrics_logger: Callable[[dict[str, Any]], None] | None = None,
     log_every_n_batches: int | None = None,
+    wandb_config: WandbConfig | None = None,
 ) -> TrainingContext:
+    wandb_runtime = None
+    if metrics_logger is None and wandb_config is not None:
+        wandb_runtime = setup_wandb_runtime(
+            wandb_config,
+            model_name=getattr(context.architecture_spec, "name", "taiko_model"),
+        )
+        metrics_logger = wandb_runtime.metrics_logger
+
     target_epochs = context.training_spec.epochs if epochs is None else int(epochs)
     context.training_spec.epochs = target_epochs
 
-    for epoch in range(context.start_epoch, target_epochs + 1):
-        train_stats = train_one_epoch(
-            model=context.model,
-            dataloader=context.dataset.train_loader,
-            optimizer=context.optimizer,
-            criterion=context.criterion,
-            device=torch.device(context.training_spec.device),
-            adherence_config=context.dataset.adherence_config,
-            metrics_logger=metrics_logger,
-            log_every_n_batches=log_every_n_batches,
-            epoch=epoch,
-            global_step_start=context.global_step,
-        )
-        val_stats = validate_one_epoch(
-            model=context.model,
-            dataloader=context.dataset.val_loader,
-            criterion=context.criterion,
-            device=torch.device(context.training_spec.device),
-            adherence_config=context.dataset.adherence_config,
-            metrics_logger=metrics_logger,
-            log_every_n_batches=log_every_n_batches,
-            epoch=epoch,
-            global_step_start=context.global_step + len(context.dataset.train_loader),
-        )
+    try:
+        for epoch in range(context.start_epoch, target_epochs + 1):
+            train_stats = train_one_epoch(
+                model=context.model,
+                dataloader=context.dataset.train_loader,
+                optimizer=context.optimizer,
+                criterion=context.criterion,
+                device=torch.device(context.training_spec.device),
+                adherence_config=context.dataset.adherence_config,
+                metrics_logger=metrics_logger,
+                log_every_n_batches=log_every_n_batches,
+                epoch=epoch,
+                global_step_start=context.global_step,
+            )
+            val_stats = validate_one_epoch(
+                model=context.model,
+                dataloader=context.dataset.val_loader,
+                criterion=context.criterion,
+                device=torch.device(context.training_spec.device),
+                adherence_config=context.dataset.adherence_config,
+                metrics_logger=metrics_logger,
+                log_every_n_batches=log_every_n_batches,
+                epoch=epoch,
+                global_step_start=context.global_step + len(context.dataset.train_loader),
+            )
 
-        current_lr = context.optimizer.param_groups[0]["lr"]
-        _append_history(context.history, train_stats, val_stats, current_lr)
-        context.global_step += len(context.dataset.train_loader)
+            current_lr = context.optimizer.param_groups[0]["lr"]
+            _append_history(context.history, train_stats, val_stats, current_lr)
+            context.global_step += len(context.dataset.train_loader)
 
-        print(
-            f"Epoch {epoch}/{target_epochs} | lr: {current_lr:.6f} | "
-            f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f}"
-        )
+            print(
+                f"Epoch {epoch}/{target_epochs} | lr: {current_lr:.6f} | "
+                f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f}"
+            )
 
-        current_best = val_stats["loss"] if context.best_val_loss is None else min(context.best_val_loss, val_stats["loss"])
-        metadata = CheckpointMetadata(
-            epoch=epoch,
-            global_step=context.global_step,
-            best_val_loss=float(current_best),
-            data_root=str(context.artifacts.data_root),
-            artifact_paths={
-                "audio_dir": _relative_to_root(context.artifacts.audio_dir, context.artifacts.data_root),
-                "token_dir": _relative_to_root(context.artifacts.token_dir, context.artifacts.data_root),
-                "chart_metadata_csv": _relative_to_root(context.artifacts.chart_metadata_csv, context.artifacts.data_root),
-                "sequence_metadata_csv": _relative_to_root(context.artifacts.sequence_metadata_csv, context.artifacts.data_root),
-                "splits_json": _relative_to_root(context.artifacts.splits_json, context.artifacts.data_root),
-                "vocab_json": _relative_to_root(context.artifacts.vocab_json, context.artifacts.data_root),
-                "checkpoints_dir": _serialize_artifact_path(context.artifacts.checkpoints_dir, context.artifacts.data_root),
-            },
-        )
-
-        save_checkpoint(
-            context.artifacts.checkpoints_dir / "last.ckpt",
-            model=context.model,
-            optimizer=context.optimizer,
-            scheduler=context.scheduler,
-            architecture_spec=context.architecture_spec,
-            training_spec=context.training_spec,
-            metadata=metadata,
-            history=context.history,
-            vocab=context.dataset.vocab,
-            split_ids=context.dataset.split_ids,
-            adherence_config=context.dataset.adherence_config,
-        )
-
-        best_updated = False
-        if context.best_val_loss is None or val_stats["loss"] < context.best_val_loss:
-            context.best_val_loss = float(val_stats["loss"])
-            best_updated = True
-            best_metadata = CheckpointMetadata(
+            current_best = val_stats["loss"] if context.best_val_loss is None else min(context.best_val_loss, val_stats["loss"])
+            metadata = CheckpointMetadata(
                 epoch=epoch,
                 global_step=context.global_step,
-                best_val_loss=context.best_val_loss,
+                best_val_loss=float(current_best),
                 data_root=str(context.artifacts.data_root),
-                artifact_paths=metadata.artifact_paths,
+                artifact_paths={
+                    "audio_dir": _relative_to_root(context.artifacts.audio_dir, context.artifacts.data_root),
+                    "token_dir": _relative_to_root(context.artifacts.token_dir, context.artifacts.data_root),
+                    "chart_metadata_csv": _relative_to_root(context.artifacts.chart_metadata_csv, context.artifacts.data_root),
+                    "sequence_metadata_csv": _relative_to_root(context.artifacts.sequence_metadata_csv, context.artifacts.data_root),
+                    "splits_json": _relative_to_root(context.artifacts.splits_json, context.artifacts.data_root),
+                    "vocab_json": _relative_to_root(context.artifacts.vocab_json, context.artifacts.data_root),
+                    "checkpoints_dir": _serialize_artifact_path(context.artifacts.checkpoints_dir, context.artifacts.data_root),
+                },
             )
+
             save_checkpoint(
-                context.artifacts.checkpoints_dir / "best.ckpt",
+                context.artifacts.checkpoints_dir / "last.ckpt",
                 model=context.model,
                 optimizer=context.optimizer,
                 scheduler=context.scheduler,
                 architecture_spec=context.architecture_spec,
                 training_spec=context.training_spec,
-                metadata=best_metadata,
+                metadata=metadata,
                 history=context.history,
                 vocab=context.dataset.vocab,
                 split_ids=context.dataset.split_ids,
                 adherence_config=context.dataset.adherence_config,
             )
 
-        if metrics_logger is not None:
-            payload: dict[str, Any] = {
-                "epoch": int(epoch),
-                "global_step": int(context.global_step),
-                "train/loss_epoch": float(train_stats["loss"]),
-                "val/loss_epoch": float(val_stats["loss"]),
-                "optimizer/lr": float(current_lr),
-                "checkpoint/last_path": str((context.artifacts.checkpoints_dir / "last.ckpt").resolve()),
-                "checkpoint/best_updated": int(best_updated),
-            }
-            if "density_proxy_abs_error" in train_stats:
-                payload["train/density_proxy_abs_error"] = float(train_stats["density_proxy_abs_error"])
-                payload["val/density_proxy_abs_error"] = float(val_stats["density_proxy_abs_error"])
-                payload["train/difficulty_proxy_drift"] = float(train_stats["difficulty_proxy_drift"])
-                payload["val/difficulty_proxy_drift"] = float(val_stats["difficulty_proxy_drift"])
-            metrics_logger(payload)
+            best_updated = False
+            if context.best_val_loss is None or val_stats["loss"] < context.best_val_loss:
+                context.best_val_loss = float(val_stats["loss"])
+                best_updated = True
+                best_metadata = CheckpointMetadata(
+                    epoch=epoch,
+                    global_step=context.global_step,
+                    best_val_loss=context.best_val_loss,
+                    data_root=str(context.artifacts.data_root),
+                    artifact_paths=metadata.artifact_paths,
+                )
+                save_checkpoint(
+                    context.artifacts.checkpoints_dir / "best.ckpt",
+                    model=context.model,
+                    optimizer=context.optimizer,
+                    scheduler=context.scheduler,
+                    architecture_spec=context.architecture_spec,
+                    training_spec=context.training_spec,
+                    metadata=best_metadata,
+                    history=context.history,
+                    vocab=context.dataset.vocab,
+                    split_ids=context.dataset.split_ids,
+                    adherence_config=context.dataset.adherence_config,
+                )
 
-        context.start_epoch = epoch + 1
+            if metrics_logger is not None:
+                payload: dict[str, Any] = {
+                    "epoch": int(epoch),
+                    "global_step": int(context.global_step),
+                    "train/loss_epoch": float(train_stats["loss"]),
+                    "val/loss_epoch": float(val_stats["loss"]),
+                    "optimizer/lr": float(current_lr),
+                    "checkpoint/last_path": str((context.artifacts.checkpoints_dir / "last.ckpt").resolve()),
+                    "checkpoint/best_updated": int(best_updated),
+                }
+                if "density_proxy_abs_error" in train_stats:
+                    payload["train/density_proxy_abs_error"] = float(train_stats["density_proxy_abs_error"])
+                    payload["val/density_proxy_abs_error"] = float(val_stats["density_proxy_abs_error"])
+                    payload["train/difficulty_proxy_drift"] = float(train_stats["difficulty_proxy_drift"])
+                    payload["val/difficulty_proxy_drift"] = float(val_stats["difficulty_proxy_drift"])
+                metrics_logger(payload)
+
+            context.start_epoch = epoch + 1
+    finally:
+        if wandb_runtime is not None and wandb_runtime.run is not None:
+            wandb_runtime.run.finish()
 
     return context

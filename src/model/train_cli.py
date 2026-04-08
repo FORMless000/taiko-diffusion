@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 from pathlib import Path
 import random
@@ -23,6 +22,7 @@ from .data import (
 from .factory import build_model
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
+from .wandb_utils import WandbConfig, setup_wandb_runtime
 
 _ARTIFACT_ABS_PREFIX = "ABS::"
 
@@ -93,33 +93,6 @@ def _artifact_paths_from_checkpoint(data_root: Path, checkpoint_payload: dict[st
         return _artifact_paths_for_root(data_root)
 
     return {key: _deserialize_artifact_path(path_value, data_root) for key, path_value in metadata.artifact_paths.items()}
-
-
-def _build_wandb_logger(args: argparse.Namespace, architecture_spec: ArchitectureSpec):
-    if not args.wandb:
-        return None
-
-    try:
-        import wandb
-    except ImportError as exc:
-        raise RuntimeError("wandb logging requested, but `wandb` is not installed. Install it with `pip install wandb`.") from exc
-
-    modelname = architecture_spec.name
-    runname = args.wandb_run_name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    run = wandb.init(
-        project="taiko-transformer",
-        name=f" taiko-transformer_run_{modelname}_{runname}_{timestamp}",
-        entity="yiy523-lehigh-university",
-    )
-    if hasattr(run, "define_metric"):
-        run.define_metric("global_step")
-        run.define_metric("*", step_metric="global_step")
-    else:
-        wandb.define_metric("global_step")
-        wandb.define_metric("*", step_metric="global_step")
-    return run
 
 
 def _resolve_data_root(args: argparse.Namespace, checkpoint_payload: dict[str, Any] | None) -> Path:
@@ -330,6 +303,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-run-name", default="default", help="Run-name tag used in the W&B run name.")
     parser.add_argument("--wandb-log-every-batches", type=int, default=100, help="Log batch metrics to W&B every N batches.")
+    parser.add_argument("--wandb-notebook-name", default="", help="Notebook name for W&B code saving (sets WANDB_NOTEBOOK_NAME).")
+    parser.add_argument("--wandb-offline", action="store_true", help="Run W&B in offline mode without online auth.")
+    parser.add_argument("--wandb-api-key", default="", help="Optional W&B API key passed at runtime (without env setup).")
     return parser
 
 
@@ -394,8 +370,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     pad_id = int(token_to_id["PAD"])
     architecture_spec = _build_architecture_spec(args, checkpoint_payload)
-    wandb_run = _build_wandb_logger(args, architecture_spec)
-    metrics_logger = wandb_run.log if wandb_run is not None else None
+    wandb_runtime = setup_wandb_runtime(
+        WandbConfig(
+            enabled=bool(args.wandb),
+            run_name=str(args.wandb_run_name),
+            log_every_n_batches=int(args.wandb_log_every_batches),
+            notebook_name=str(args.wandb_notebook_name),
+            offline=bool(args.wandb_offline),
+            api_key=str(args.wandb_api_key),
+            mode_name_for_run=architecture_spec.name,
+        ),
+        model_name=architecture_spec.name,
+    )
+    metrics_logger = wandb_runtime.metrics_logger
 
     train_dataset, collate, label_ignore_index = build_dataset_for_spec(
         train_seq_index,
@@ -467,8 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Checkpoint already at epoch {start_epoch - 1}, which is >= requested total epochs {training_spec.epochs}. "
             "Nothing to do."
         )
-        if wandb_run is not None:
-            wandb_run.finish()
+        if wandb_runtime.run is not None:
+            wandb_runtime.run.finish()
         return 0
 
     for epoch in range(start_epoch, training_spec.epochs + 1):
@@ -577,8 +564,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 epoch_payload["val/difficulty_proxy_drift"] = float(val_stats["difficulty_proxy_drift"])
             metrics_logger(epoch_payload)
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    if wandb_runtime.run is not None:
+        wandb_runtime.run.finish()
 
     return 0
 
