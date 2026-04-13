@@ -247,10 +247,39 @@ class TestRunPipelineCaching(unittest.TestCase):
                 )
 
             chart_df = pd.read_csv(index_dir / "chart_build_summary.csv")
-            self.assertEqual(chart_df.iloc[0]["status"], "error")
-            self.assertEqual(chart_df.iloc[0]["error_type"], "non_constant_bpm")
+            self.assertEqual(chart_df.iloc[0]["status"], "filtered")
+            self.assertEqual(chart_df.iloc[0]["filter_type"], "non_constant_bpm")
             self.assertEqual(int(chart_df.iloc[0]["n_bpm_points"]), 4)
             self.assertEqual(int(chart_df.iloc[0]["unique_uninherited_mpb_count"]), 2)
+
+    def test_shared_audio_artifact_reused_for_same_audio(self):
+        bad = _import_bad_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shared_dir = root / "audio_shared_npz"
+            audio_path = root / "same.mp3"
+            audio_path.write_bytes(b"fake-audio")
+
+            with patch.object(
+                bad,
+                "get_audio_info",
+                return_value={
+                    "waveform": np.zeros(8, dtype=np.float32),
+                    "sample_rate": 8,
+                    "audio_duration_ms": 1000.0,
+                },
+            ), patch.object(
+                bad,
+                "build_raw_mel_spectrogram",
+                return_value=(np.ones((4, 128), dtype=np.float32), np.arange(4, dtype=np.float64)),
+            ) as mel_mock:
+                cache = {}
+                a = bad.load_or_build_shared_audio_artifact(audio_path, shared_dir, shared_audio_cache=cache)
+                b = bad.load_or_build_shared_audio_artifact(audio_path, shared_dir, shared_audio_cache=cache)
+
+            self.assertEqual(mel_mock.call_count, 1)
+            self.assertEqual(a["shared_audio_id"], b["shared_audio_id"])
+            self.assertTrue(Path(a["shared_audio_npz_path"]).exists())
 
 
 if __name__ == "__main__":

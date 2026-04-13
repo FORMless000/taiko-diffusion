@@ -47,10 +47,12 @@ class TestModelFactory(unittest.TestCase):
             history_max_tokens=32,
             retrieval_top_k=1,
             retrieval_max_tokens_per_window=16,
+            max_cached_charts=9,
         )
         model = build_model(spec, vocab_size=17)
         self.assertIsInstance(model, TaikoContextTransformer)
         self.assertEqual(model.history_max_tokens, 32)
+        self.assertFalse(hasattr(model, "max_cached_charts"))
 
 
 if __name__ == "__main__":

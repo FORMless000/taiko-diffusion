@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -83,6 +84,45 @@ def _write_dummy_dataset(data_root: Path, num_charts: int = 10) -> None:
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class TestTrainCli(unittest.TestCase):
+    def test_cli_passes_preprocessing_flags_when_raw_osz_is_provided(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir) / "dataset"
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            (raw_dir / "a.osz").write_text("placeholder", encoding="utf-8")
+
+            with patch("src.preprocessing.prepare_training_data.prepare_training_data") as prepare_mock:
+                with self.assertRaises(FileNotFoundError):
+                    train_main(
+                        [
+                            str(raw_dir),
+                            "--data-root",
+                            str(data_root),
+                            "--overwrite-unpack",
+                            "--overwrite-parsed",
+                            "--overwrite-dataset-outputs",
+                            "--allow-offgrid-notes",
+                            "--offgrid-tolerance-ms",
+                            "7.5",
+                            "--keep-only-max-notes-per-song",
+                            "--epochs",
+                            "1",
+                            "--device",
+                            "cpu",
+                        ]
+                    )
+
+            prepare_mock.assert_called_once()
+            kwargs = prepare_mock.call_args.kwargs
+            self.assertEqual(kwargs["osz_inputs"], [str(raw_dir)])
+            self.assertEqual(str(kwargs["data_root"]), str(data_root.resolve()))
+            self.assertTrue(kwargs["overwrite_unpack"])
+            self.assertTrue(kwargs["overwrite_parsed"])
+            self.assertTrue(kwargs["overwrite_dataset_outputs"])
+            self.assertFalse(kwargs["reject_offgrid_notes"])
+            self.assertEqual(kwargs["offgrid_tolerance_ms"], 7.5)
+            self.assertTrue(kwargs["keep_only_max_notes_per_song"])
+
     def test_cli_without_wandb_does_not_import_wandb_module(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_root = Path(tmpdir)
@@ -230,6 +270,122 @@ class TestTrainCli(unittest.TestCase):
             self.assertEqual(payload["metadata"]["epoch"], 2)
             self.assertEqual((data_root / "training" / "splits.json").read_text(encoding="utf-8"), splits_before)
             self.assertEqual((data_root / "training" / "vocab.json").read_text(encoding="utf-8"), vocab_before)
+
+    def test_cli_context_max_cached_charts_persists_in_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir)
+            _write_dummy_dataset(data_root)
+            checkpoints_dir = data_root / "repo_checkpoints" / "context"
+
+            rc = train_main(
+                [
+                    "--data-root",
+                    str(data_root),
+                    "--checkpoints-dir",
+                    str(checkpoints_dir),
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "4",
+                    "--lr",
+                    "0.001",
+                    "--device",
+                    "cpu",
+                    "--architecture-name",
+                    "taiko_context_transformer",
+                    "--d-model",
+                    "16",
+                    "--nhead",
+                    "4",
+                    "--num-encoder-layers",
+                    "1",
+                    "--num-decoder-layers",
+                    "1",
+                    "--dim-feedforward",
+                    "32",
+                    "--max-len",
+                    "32",
+                    "--max-cached-charts",
+                    "3",
+                ]
+            )
+
+            self.assertEqual(rc, 0)
+            payload = load_checkpoint(checkpoints_dir / "last.ckpt", map_location="cpu")
+            self.assertEqual(payload["architecture_spec"]["name"], "taiko_context_transformer")
+            self.assertEqual(payload["architecture_spec"]["max_cached_charts"], 3)
+
+    def test_cli_context_resume_keeps_or_overrides_max_cached_charts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir)
+            _write_dummy_dataset(data_root)
+            checkpoints_dir = data_root / "repo_checkpoints" / "context"
+            checkpoint_path = checkpoints_dir / "last.ckpt"
+
+            first_run = [
+                "--data-root",
+                str(data_root),
+                "--checkpoints-dir",
+                str(checkpoints_dir),
+                "--epochs",
+                "1",
+                "--batch-size",
+                "4",
+                "--lr",
+                "0.001",
+                "--device",
+                "cpu",
+                "--architecture-name",
+                "taiko_context_transformer",
+                "--d-model",
+                "16",
+                "--nhead",
+                "4",
+                "--num-encoder-layers",
+                "1",
+                "--num-decoder-layers",
+                "1",
+                "--dim-feedforward",
+                "32",
+                "--max-len",
+                "32",
+                "--max-cached-charts",
+                "3",
+            ]
+            self.assertEqual(train_main(first_run), 0)
+            self.assertEqual(load_checkpoint(checkpoint_path, map_location="cpu")["architecture_spec"]["max_cached_charts"], 3)
+
+            resume_without_override = [
+                "--resume-checkpoint",
+                str(checkpoint_path),
+                "--checkpoints-dir",
+                str(checkpoints_dir),
+                "--epochs",
+                "2",
+                "--batch-size",
+                "4",
+                "--device",
+                "cpu",
+            ]
+            self.assertEqual(train_main(resume_without_override), 0)
+            self.assertEqual(load_checkpoint(checkpoint_path, map_location="cpu")["architecture_spec"]["max_cached_charts"], 3)
+
+            resume_with_override = [
+                "--resume-checkpoint",
+                str(checkpoint_path),
+                "--checkpoints-dir",
+                str(checkpoints_dir),
+                "--epochs",
+                "3",
+                "--batch-size",
+                "4",
+                "--device",
+                "cpu",
+                "--max-cached-charts",
+                "6",
+            ]
+            self.assertEqual(train_main(resume_with_override), 0)
+            self.assertEqual(load_checkpoint(checkpoint_path, map_location="cpu")["architecture_spec"]["max_cached_charts"], 6)
 
     def test_cli_wandb_logs_batch_and_epoch_metrics(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -117,6 +117,52 @@ class TestContextDataset(unittest.TestCase):
             expected = dataset._serialize_window_token_ids([3, 7, 4], limit=8)
             self.assertEqual(retrieved_ids, expected)
 
+    def test_context_chart_cache_is_bounded_lru(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            audio_dir = root / "audio_npz"
+            token_dir = root / "token_json"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            token_dir.mkdir(parents=True, exist_ok=True)
+
+            chart_ids = ["100_a", "101_b", "102_c"]
+            meta_rows = []
+            for i, chart_id in enumerate(chart_ids):
+                audio = np.zeros((1, 192, 128), dtype=np.float32)
+                audio[0, :, i % 3] = 1.0
+                np.savez_compressed(audio_dir / f"{chart_id}.npz", audio_sequences=audio)
+                token_payload = [{"seq_idx": 0, "tokens": ["DON", "TS_2", "KAT"]}]
+                (token_dir / f"{chart_id}.json").write_text(__import__("json").dumps(token_payload), encoding="utf-8")
+                meta_rows.append({"chart_id": chart_id, "difficulty_value": 5.0, "bpm": 180.0, "beatmap_id": 1000 + i})
+
+            meta_csv = root / "chart_meta.csv"
+            pd.DataFrame(meta_rows).to_csv(meta_csv, index=False)
+            manifest = build_chart_manifest(audio_dir, token_dir, chart_metadata_csv=meta_csv)
+            seq_index = build_sequence_index(manifest, chart_ids)
+
+            token_to_id = {
+                "PAD": 0,
+                "BOS": 1,
+                "EOS": 2,
+                "DON": 3,
+                "KAT": 4,
+                "TS_2": 5,
+            }
+            dataset = TaikoContextDataset(
+                seq_index,
+                token_to_id,
+                max_cached_charts=2,
+            )
+
+            dataset._load_chart_samples("100_a")
+            dataset._load_chart_samples("101_b")
+            self.assertEqual(len(dataset._chart_cache), 2)
+            dataset._load_chart_samples("102_c")
+            self.assertEqual(len(dataset._chart_cache), 2)
+            self.assertNotIn("100_a", dataset._chart_cache)
+            self.assertIn("101_b", dataset._chart_cache)
+            self.assertIn("102_c", dataset._chart_cache)
+
 
 if __name__ == "__main__":
     unittest.main()

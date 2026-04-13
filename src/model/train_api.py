@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import random
+import time
 from typing import Any, Callable
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
@@ -28,6 +31,7 @@ from .trainer import train_one_epoch, validate_one_epoch
 from .wandb_utils import WandbConfig, setup_wandb_runtime
 
 _ARTIFACT_ABS_PREFIX = "ABS::"
+_INDEX_CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -140,6 +144,108 @@ def _append_history(history: dict[str, list[float]], train_stats: dict[str, Any]
         history["val_difficulty_proxy_drift"].append(float(val_stats["difficulty_proxy_drift"]))
 
 
+def _stage_log(enabled: bool, stage: str, start_ts: float | None = None) -> float:
+    if start_ts is None:
+        if enabled:
+            print(f"[startup] {stage}...")
+        return time.perf_counter()
+    elapsed = time.perf_counter() - start_ts
+    if enabled:
+        print(f"[startup] {stage} done in {elapsed:.2f}s")
+    return elapsed
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"exists": False}
+    st = path.stat()
+    return {
+        "exists": True,
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _dataset_index_signature(
+    artifacts: TrainingArtifacts,
+    training_spec: TrainingSpec,
+    architecture_spec: ArchitectureSpec,
+) -> str:
+    payload = {
+        "schema_version": _INDEX_CACHE_SCHEMA_VERSION,
+        "chart_summary": _file_fingerprint(artifacts.chart_metadata_csv),
+        "sequence_metadata": _file_fingerprint(artifacts.sequence_metadata_csv),
+        "splits_file": _file_fingerprint(artifacts.splits_json),
+        "architecture_mode": str(architecture_spec.name),
+        "split_seed": int(training_spec.seed),
+        "split_ratios": [
+            float(training_spec.train_ratio),
+            float(training_spec.val_ratio),
+            float(training_spec.test_ratio),
+        ],
+        "data_root": str(artifacts.data_root),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _index_cache_paths(index_cache_dir: Path, signature: str) -> dict[str, Path]:
+    cache_root = index_cache_dir / signature
+    return {
+        "root": cache_root,
+        "meta_json": cache_root / "meta.json",
+        "split_ids_json": cache_root / "split_ids.json",
+        "manifest_pkl": cache_root / "manifest.pkl",
+        "train_seq_pkl": cache_root / "train_seq_index.pkl",
+        "val_seq_pkl": cache_root / "val_seq_index.pkl",
+        "test_seq_pkl": cache_root / "test_seq_index.pkl",
+    }
+
+
+def _load_index_cache(cache_paths: dict[str, Path]) -> dict[str, Any] | None:
+    required = [
+        "meta_json",
+        "split_ids_json",
+        "manifest_pkl",
+        "train_seq_pkl",
+        "val_seq_pkl",
+        "test_seq_pkl",
+    ]
+    if any(not cache_paths[key].exists() for key in required):
+        return None
+    try:
+        meta = _load_json(cache_paths["meta_json"])
+        if int(meta.get("schema_version", -1)) != _INDEX_CACHE_SCHEMA_VERSION:
+            return None
+        return {
+            "manifest_df": pd.read_pickle(cache_paths["manifest_pkl"]),
+            "split_ids": _load_json(cache_paths["split_ids_json"]),
+            "train_seq_index": pd.read_pickle(cache_paths["train_seq_pkl"]),
+            "val_seq_index": pd.read_pickle(cache_paths["val_seq_pkl"]),
+            "test_seq_index": pd.read_pickle(cache_paths["test_seq_pkl"]),
+        }
+    except Exception:
+        return None
+
+
+def _save_index_cache(
+    cache_paths: dict[str, Path],
+    *,
+    manifest_df,
+    split_ids: dict[str, list[str]],
+    train_seq_index,
+    val_seq_index,
+    test_seq_index,
+) -> None:
+    cache_paths["root"].mkdir(parents=True, exist_ok=True)
+    _save_json(cache_paths["meta_json"], {"schema_version": _INDEX_CACHE_SCHEMA_VERSION})
+    _save_json(cache_paths["split_ids_json"], split_ids)
+    manifest_df.to_pickle(cache_paths["manifest_pkl"])
+    train_seq_index.to_pickle(cache_paths["train_seq_pkl"])
+    val_seq_index.to_pickle(cache_paths["val_seq_pkl"])
+    test_seq_index.to_pickle(cache_paths["test_seq_pkl"])
+
+
 def build_training_artifacts(data_root: str | Path, checkpoints_dir: str | Path | None = None) -> TrainingArtifacts:
     data_root = Path(data_root).resolve()
     training_dir = data_root / "training"
@@ -230,27 +336,106 @@ def create_dataset_bundle(
     artifacts: TrainingArtifacts,
     training_spec: TrainingSpec,
     architecture_spec: ArchitectureSpec | None = None,
+    *,
+    use_index_cache: bool = True,
+    index_cache_dir: str | Path | None = None,
+    log_startup: bool = True,
+    max_cached_charts: int | None = None,
 ) -> DatasetBundle:
     architecture_spec = architecture_spec or ArchitectureSpec()
-    manifest_df = build_chart_manifest(
-        artifacts.audio_dir,
-        artifacts.token_dir,
-        chart_metadata_csv=artifacts.chart_metadata_csv,
+    resolved_max_cached = (
+        int(max_cached_charts)
+        if max_cached_charts is not None
+        else int(getattr(architecture_spec, "max_cached_charts", 4))
     )
-    if manifest_df.empty:
-        raise RuntimeError("No training samples were found in the dataset artifacts.")
+    architecture_spec.max_cached_charts = max(1, resolved_max_cached)
 
-    split_ids = _load_or_create_splits(manifest_df, training_spec, artifacts.splits_json)
-    train_seq_index = build_sequence_index(manifest_df, split_ids["train"])
-    val_seq_index = build_sequence_index(manifest_df, split_ids["val"])
-    test_seq_index = build_sequence_index(manifest_df, split_ids["test"])
+    manifest_df = None
+    split_ids = None
+    train_seq_index = None
+    val_seq_index = None
+    test_seq_index = None
+    cache_hit = False
+
+    if use_index_cache:
+        stage = _stage_log(log_startup, "index cache lookup")
+        cache_root = Path(index_cache_dir).resolve() if index_cache_dir is not None else (artifacts.training_dir / "index_cache")
+        signature = _dataset_index_signature(artifacts, training_spec, architecture_spec)
+        cache_paths = _index_cache_paths(cache_root, signature)
+        cached = _load_index_cache(cache_paths)
+        if cached is not None:
+            manifest_df = cached["manifest_df"]
+            split_ids = cached["split_ids"]
+            train_seq_index = cached["train_seq_index"]
+            val_seq_index = cached["val_seq_index"]
+            test_seq_index = cached["test_seq_index"]
+            cache_hit = True
+            if log_startup:
+                print(f"[startup] index cache hit: {cache_paths['root']}")
+        _stage_log(log_startup, "index cache lookup", stage)
+
+    if not cache_hit:
+        stage = _stage_log(log_startup, "manifest")
+        manifest_df = build_chart_manifest(
+            artifacts.audio_dir,
+            artifacts.token_dir,
+            chart_metadata_csv=artifacts.chart_metadata_csv,
+            sequence_metadata_csv=artifacts.sequence_metadata_csv,
+            prefer_metadata=True,
+        )
+        _stage_log(log_startup, "manifest", stage)
+        if manifest_df.empty:
+            raise RuntimeError("No training samples were found in the dataset artifacts.")
+
+        stage = _stage_log(log_startup, "splits")
+        split_ids = _load_or_create_splits(manifest_df, training_spec, artifacts.splits_json)
+        _stage_log(log_startup, "splits", stage)
+
+        stage = _stage_log(log_startup, "indexes")
+        train_seq_index = build_sequence_index(
+            manifest_df,
+            split_ids["train"],
+            sequence_metadata_csv=artifacts.sequence_metadata_csv,
+            prefer_metadata=True,
+        )
+        val_seq_index = build_sequence_index(
+            manifest_df,
+            split_ids["val"],
+            sequence_metadata_csv=artifacts.sequence_metadata_csv,
+            prefer_metadata=True,
+        )
+        test_seq_index = build_sequence_index(
+            manifest_df,
+            split_ids["test"],
+            sequence_metadata_csv=artifacts.sequence_metadata_csv,
+            prefer_metadata=True,
+        )
+        _stage_log(log_startup, "indexes", stage)
+
+        if use_index_cache:
+            stage = _stage_log(log_startup, "index cache save")
+            cache_root = Path(index_cache_dir).resolve() if index_cache_dir is not None else (artifacts.training_dir / "index_cache")
+            signature = _dataset_index_signature(artifacts, training_spec, architecture_spec)
+            cache_paths = _index_cache_paths(cache_root, signature)
+            _save_index_cache(
+                cache_paths,
+                manifest_df=manifest_df,
+                split_ids=split_ids,
+                train_seq_index=train_seq_index,
+                val_seq_index=val_seq_index,
+                test_seq_index=test_seq_index,
+            )
+            _stage_log(log_startup, "index cache save", stage)
 
     if train_seq_index.empty or val_seq_index.empty:
         raise RuntimeError("Train/validation split produced no samples. Add more charts or adjust split ratios.")
 
+    stage = _stage_log(log_startup, "vocab")
     vocab = _load_or_create_vocab(train_seq_index, val_seq_index, test_seq_index, artifacts.vocab_json)
+    _stage_log(log_startup, "vocab", stage)
     token_to_id = vocab["token_to_id"]
     pad_id = int(token_to_id["PAD"])
+    stage = _stage_log(log_startup, "dataset objects")
     train_dataset, collate_fn, label_ignore_index = build_dataset_for_spec(
         train_seq_index,
         token_to_id,
@@ -266,6 +451,7 @@ def create_dataset_bundle(
         token_to_id,
         architecture_spec,
     )
+    _stage_log(log_startup, "dataset objects", stage)
 
     train_loader = DataLoader(
         train_dataset,
@@ -317,13 +503,25 @@ def create_training_context(
     architecture_spec: ArchitectureSpec | None = None,
     training_spec: TrainingSpec | None = None,
     checkpoints_dir: str | Path | None = None,
+    use_index_cache: bool = True,
+    index_cache_dir: str | Path | None = None,
+    log_startup: bool = True,
+    max_cached_charts: int | None = None,
 ) -> TrainingContext:
     artifacts = build_training_artifacts(data_root, checkpoints_dir=checkpoints_dir)
     architecture_spec = architecture_spec or ArchitectureSpec()
     training_spec = training_spec or TrainingSpec(device=_default_device())
 
     _set_global_seed(training_spec.seed)
-    dataset = create_dataset_bundle(artifacts, training_spec, architecture_spec)
+    dataset = create_dataset_bundle(
+        artifacts,
+        training_spec,
+        architecture_spec,
+        use_index_cache=use_index_cache,
+        index_cache_dir=index_cache_dir,
+        log_startup=log_startup,
+        max_cached_charts=max_cached_charts,
+    )
 
     model = build_model(architecture_spec, vocab_size=len(dataset.vocab["token_to_id"]))
     device = torch.device(training_spec.device)
@@ -361,6 +559,10 @@ def load_training_context_from_checkpoint(
     batch_size: int | None = None,
     num_workers: int | None = None,
     checkpoints_dir: str | Path | None = None,
+    use_index_cache: bool = True,
+    index_cache_dir: str | Path | None = None,
+    log_startup: bool = True,
+    max_cached_charts: int | None = None,
 ) -> TrainingContext:
     checkpoint_path = Path(checkpoint_path).resolve()
     payload = load_checkpoint(checkpoint_path, map_location="cpu")
@@ -390,6 +592,10 @@ def load_training_context_from_checkpoint(
         architecture_spec=architecture_spec,
         training_spec=training_spec,
         checkpoints_dir=resolved_checkpoints_dir,
+        use_index_cache=use_index_cache,
+        index_cache_dir=index_cache_dir,
+        log_startup=log_startup,
+        max_cached_charts=max_cached_charts,
     )
 
     context.model.load_state_dict(payload["model_state_dict"])

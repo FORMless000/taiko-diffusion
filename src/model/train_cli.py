@@ -201,24 +201,28 @@ def _load_or_create_vocab(
 
 def _build_architecture_spec(args: argparse.Namespace, checkpoint_payload: dict[str, Any] | None) -> ArchitectureSpec:
     if checkpoint_payload is not None:
-        return ArchitectureSpec.from_dict(checkpoint_payload["architecture_spec"])
+        spec = ArchitectureSpec.from_dict(checkpoint_payload["architecture_spec"])
+    else:
+        spec = ArchitectureSpec(
+            name=args.architecture_name,
+            input_dim=args.input_dim,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_encoder_layers=args.num_encoder_layers,
+            num_decoder_layers=args.num_decoder_layers,
+            dim_feedforward=args.dim_feedforward,
+            dropout=args.dropout,
+            max_len=args.max_len,
+            history_max_tokens=args.history_max_tokens,
+            retrieval_top_k=args.retrieval_top_k,
+            retrieval_max_tokens_per_window=args.retrieval_max_tokens_per_window,
+            retrieval_exclude_last_n_windows=args.retrieval_exclude_last_n_windows,
+            use_motif_retrieval=args.use_motif_retrieval,
+        )
 
-    return ArchitectureSpec(
-        name=args.architecture_name,
-        input_dim=args.input_dim,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
-        max_len=args.max_len,
-        history_max_tokens=args.history_max_tokens,
-        retrieval_top_k=args.retrieval_top_k,
-        retrieval_max_tokens_per_window=args.retrieval_max_tokens_per_window,
-        retrieval_exclude_last_n_windows=args.retrieval_exclude_last_n_windows,
-        use_motif_retrieval=args.use_motif_retrieval,
-    )
+    if args.max_cached_charts is not None:
+        spec.max_cached_charts = max(1, int(args.max_cached_charts))
+    return spec
 
 
 def _build_training_spec(args: argparse.Namespace, checkpoint_payload: dict[str, Any] | None) -> TrainingSpec:
@@ -273,6 +277,16 @@ def _append_history(history: dict[str, list[float]], train_stats: dict[str, Any]
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the taiko model from raw .osz files or existing dataset artifacts.")
     parser.add_argument("raw_osz", nargs="*", help="Raw .osz files, directories, or glob patterns.")
+    parser.add_argument("--overwrite-unpack", action="store_true", help="Re-extract beatmap archives if already unpacked.")
+    parser.add_argument("--overwrite-parsed", action="store_true", help="Rebuild parsed JSONs even if they already exist.")
+    parser.add_argument(
+        "--overwrite-dataset-outputs",
+        action="store_true",
+        help="Rebuild beat-aligned dataset outputs even when per-chart files already exist.",
+    )
+    parser.add_argument("--allow-offgrid-notes", action="store_true", help="Do not reject off-grid notes during dataset build.")
+    parser.add_argument("--offgrid-tolerance-ms", type=float, default=5.0, help="Maximum allowed off-grid deviation in milliseconds.")
+    parser.add_argument("--keep-only-max-notes-per-song", action="store_true", help="Keep only the chart with the highest model note count per song.")
     parser.add_argument("--data-root", help="Dataset root containing unpacked and beat-aligned artifacts.")
     parser.add_argument("--resume-checkpoint", help="Resume training from a saved checkpoint.")
     parser.add_argument("--checkpoints-dir", help="Optional checkpoint output directory override.")
@@ -300,6 +314,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retrieval-max-tokens-per-window", type=int, default=64, help="Maximum retrieved tokens to prepend for each prior window.")
     parser.add_argument("--retrieval-exclude-last-n-windows", type=int, default=2, help="Skip the most recent windows when retrieving repeated motifs.")
     parser.add_argument("--use-motif-retrieval", action=argparse.BooleanOptionalAction, default=True, help="Enable audio-similarity motif retrieval for the context transformer.")
+    parser.add_argument("--max-cached-charts", type=int, default=None, help="Cap the number of chart payloads cached in the context dataset.")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-run-name", default="default", help="Run-name tag used in the W&B run name.")
     parser.add_argument("--wandb-log-every-batches", type=int, default=100, help="Log batch metrics to W&B every N batches.")
@@ -331,6 +346,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepare_training_data(
             osz_inputs=args.raw_osz,
             data_root=data_root,
+            overwrite_unpack=args.overwrite_unpack,
+            overwrite_parsed=args.overwrite_parsed,
+            overwrite_dataset_outputs=args.overwrite_dataset_outputs,
+            reject_offgrid_notes=not args.allow_offgrid_notes,
+            offgrid_tolerance_ms=args.offgrid_tolerance_ms,
+            keep_only_max_notes_per_song=args.keep_only_max_notes_per_song,
         )
 
     _require_dataset_artifacts(artifact_paths)
@@ -342,6 +363,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         artifact_paths["audio_dir"],
         artifact_paths["token_dir"],
         chart_metadata_csv=artifact_paths["chart_metadata_csv"],
+        sequence_metadata_csv=artifact_paths["sequence_metadata_csv"],
+        prefer_metadata=True,
     )
     if manifest_df.empty:
         raise RuntimeError("No training samples were found in the dataset artifacts.")
@@ -353,9 +376,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_payload=checkpoint_payload,
     )
 
-    train_seq_index = build_sequence_index(manifest_df, split_ids["train"])
-    val_seq_index = build_sequence_index(manifest_df, split_ids["val"])
-    test_seq_index = build_sequence_index(manifest_df, split_ids["test"])
+    train_seq_index = build_sequence_index(
+        manifest_df,
+        split_ids["train"],
+        sequence_metadata_csv=artifact_paths["sequence_metadata_csv"],
+        prefer_metadata=True,
+    )
+    val_seq_index = build_sequence_index(
+        manifest_df,
+        split_ids["val"],
+        sequence_metadata_csv=artifact_paths["sequence_metadata_csv"],
+        prefer_metadata=True,
+    )
+    test_seq_index = build_sequence_index(
+        manifest_df,
+        split_ids["test"],
+        sequence_metadata_csv=artifact_paths["sequence_metadata_csv"],
+        prefer_metadata=True,
+    )
     if train_seq_index.empty or val_seq_index.empty:
         raise RuntimeError("Train/validation split produced no samples. Add more charts or adjust split ratios.")
 

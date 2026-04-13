@@ -33,12 +33,14 @@ class ArchitectureSpec:
     retrieval_max_tokens_per_window: int = 64
     retrieval_exclude_last_n_windows: int = 2
     use_motif_retrieval: bool = True
+    max_cached_charts: int = 4
 
     def __post_init__(self) -> None:
         self.history_max_tokens = max(1, int(self.history_max_tokens))
         self.retrieval_top_k = max(0, int(self.retrieval_top_k))
         self.retrieval_max_tokens_per_window = max(1, int(self.retrieval_max_tokens_per_window))
         self.retrieval_exclude_last_n_windows = max(0, int(self.retrieval_exclude_last_n_windows))
+        self.max_cached_charts = max(1, int(self.max_cached_charts))
         self.max_len = max(1, int(self.max_len))
 
         if self.name == "taiko_context_transformer":
@@ -63,6 +65,11 @@ class ArchitectureSpec:
             "retrieval_max_tokens_per_window": self.retrieval_max_tokens_per_window,
             "retrieval_exclude_last_n_windows": self.retrieval_exclude_last_n_windows,
             "use_motif_retrieval": self.use_motif_retrieval,
+        }
+
+    def dataset_context_kwargs(self) -> dict[str, Any]:
+        return {
+            "max_cached_charts": self.max_cached_charts,
         }
 
     def required_context_max_len(self) -> int:

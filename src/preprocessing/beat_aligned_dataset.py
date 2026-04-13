@@ -26,6 +26,8 @@ The script is designed for GitHub use:
 
 from __future__ import annotations
 
+from collections import Counter
+import hashlib
 import json
 import logging
 import re
@@ -66,6 +68,17 @@ MODEL_EVENT_TYPES = {
 }
 
 ALLOWED_EVENT_TYPES = MODEL_EVENT_TYPES | {"bpmchange"}
+
+FILTERABLE_ERROR_TYPES = {
+    "non_constant_bpm",
+    "no_bpm_points",
+    "timing_points_missing",
+    "off_grid_notes",
+    "outside_grid_notes",
+    "collision_frames",
+    "no_model_events",
+    "no_sequences",
+}
 
 
 # ============================================================================
@@ -155,6 +168,13 @@ def chart_uid(folder_id: Any, chart_base: str) -> str:
 
 
 
+def shared_audio_uid(audio_path: Path) -> str:
+    """Build a stable shared-audio id from normalized audio path identity."""
+    normalized_path = str(audio_path.resolve()).lower()
+    digest = hashlib.sha1(normalized_path.encode("utf-8")).hexdigest()[:16]
+    return f"{sanitize_filename(audio_path.stem)}_{digest}"
+
+
 def safe_json_dump(obj: Any, path: Path) -> None:
     """Write JSON with UTF-8 encoding and readable indentation."""
     with open(path, "w", encoding="utf-8") as f:
@@ -213,6 +233,27 @@ def classify_processing_error(exc: Exception) -> Tuple[str, str]:
     if "No full 4-beat sequences available" in detail:
         return "no_sequences", detail
     return "chart_processing_error", detail
+
+
+def classify_chart_exception(exc: Exception) -> Dict[str, str]:
+    error_type, error_detail = classify_processing_error(exc)
+    if error_type in FILTERABLE_ERROR_TYPES:
+        return {
+            "status": "filtered",
+            "error_type": "",
+            "error_detail": "",
+            "error_message": "",
+            "filter_type": error_type,
+            "filter_detail": error_detail,
+        }
+    return {
+        "status": "error",
+        "error_type": error_type,
+        "error_detail": error_detail,
+        "error_message": error_detail,
+        "filter_type": "",
+        "filter_detail": "",
+    }
 
 
 def normalize_song_text(text: Any) -> str:
@@ -889,6 +930,94 @@ def build_per_sequence_event_tokens(model_df: pd.DataFrame, total_sequences: int
 
 
 # ============================================================================
+# Shared-audio artifact and filter policy helpers
+# ============================================================================
+
+
+def load_or_build_shared_audio_artifact(
+    audio_path: Path,
+    audio_shared_npz_dir: Path,
+    *,
+    overwrite_dataset_outputs: bool = False,
+    shared_audio_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    shared_audio_id = shared_audio_uid(audio_path)
+    if shared_audio_cache is not None and shared_audio_id in shared_audio_cache:
+        return shared_audio_cache[shared_audio_id]
+
+    ensure_dir(audio_shared_npz_dir)
+    shared_audio_npz_path = audio_shared_npz_dir / f"{shared_audio_id}.npz"
+
+    if shared_audio_npz_path.exists() and not overwrite_dataset_outputs:
+        payload = np.load(shared_audio_npz_path)
+        result = {
+            "shared_audio_id": shared_audio_id,
+            "shared_audio_npz_path": shared_audio_npz_path,
+            "mel_spec_db": payload["mel_spec_db"],
+            "orig_frame_times_ms": payload["orig_frame_times_ms"],
+            "audio_duration_ms": float(payload["audio_duration_ms"].item()),
+        }
+    else:
+        audio_info = get_audio_info(audio_path)
+        mel_spec_db, orig_frame_times_ms = build_raw_mel_spectrogram(
+            audio_info["waveform"],
+            audio_info["sample_rate"],
+        )
+        np.savez_compressed(
+            shared_audio_npz_path,
+            mel_spec_db=mel_spec_db,
+            orig_frame_times_ms=orig_frame_times_ms,
+            audio_duration_ms=np.array([audio_info["audio_duration_ms"]], dtype=np.float64),
+        )
+        result = {
+            "shared_audio_id": shared_audio_id,
+            "shared_audio_npz_path": shared_audio_npz_path,
+            "mel_spec_db": mel_spec_db,
+            "orig_frame_times_ms": orig_frame_times_ms,
+            "audio_duration_ms": float(audio_info["audio_duration_ms"]),
+        }
+
+    if shared_audio_cache is not None:
+        shared_audio_cache[shared_audio_id] = result
+    return result
+
+
+def enforce_chart_filter_policy(
+    notes_info: NotesInfo,
+    model_df: pd.DataFrame,
+    beat_grid_info: BeatGridInfo,
+    *,
+    reject_offgrid_notes: bool = True,
+    offgrid_tolerance_ms: float = 5.0,
+) -> None:
+    if notes_info.model_events == 0:
+        raise ChartBuildError("no_model_events", "No modeling events found after filtering event types")
+
+    if reject_offgrid_notes:
+        tolerance_with_epsilon = offgrid_tolerance_ms + 1e-9
+        offgrid_df = model_df[model_df["offgrid_abs_error_ms"] > tolerance_with_epsilon]
+        if not offgrid_df.empty:
+            max_deviation_ms = float(offgrid_df["offgrid_abs_error_ms"].max())
+            raise ChartBuildError(
+                "off_grid_notes",
+                f"Found {len(offgrid_df)} off-grid model notes (> {offgrid_tolerance_ms:.3f} ms); "
+                f"max deviation={max_deviation_ms:.3f} ms",
+            )
+
+    if notes_info.outside_event_count > 0:
+        raise ChartBuildError(
+            "outside_grid_notes",
+            f"Found {notes_info.outside_event_count} note events outside frame grid",
+        )
+
+    if notes_info.collision_frame_count > 0:
+        raise ChartBuildError("collision_frames", f"Found {notes_info.collision_frame_count} collision frames")
+
+    if beat_grid_info.total_sequences == 0:
+        raise ChartBuildError("no_sequences", "No full 4-beat sequences available")
+
+
+# ============================================================================
 # Wrapper for one chart
 # ============================================================================
 
@@ -896,8 +1025,11 @@ def build_per_sequence_event_tokens(model_df: pd.DataFrame, total_sequences: int
 def process_one_chart_row(
     row: pd.Series,
     dataset_dir: Path,
+    *,
     reject_offgrid_notes: bool = True,
     offgrid_tolerance_ms: float = 5.0,
+    overwrite_dataset_outputs: bool = False,
+    shared_audio_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Run the full 9-step pipeline for one chart row from the mapping table.
@@ -916,11 +1048,16 @@ def process_one_chart_row(
     metadata = load_chart_metadata(metadata_path)
 
     timing_info = get_timing_info(timing_path)
-    audio_info = get_audio_info(audio_path)
+    shared_audio_artifact = load_or_build_shared_audio_artifact(
+        audio_path,
+        dataset_dir / "audio_shared_npz",
+        overwrite_dataset_outputs=overwrite_dataset_outputs,
+        shared_audio_cache=shared_audio_cache,
+    )
     beat_grid_info, _ = compute_beat_grid_info(
         timing_info.offset_ms,
         timing_info.beat_duration_ms,
-        audio_info["audio_duration_ms"],
+        shared_audio_artifact["audio_duration_ms"],
     )
     events = load_note_events(notes_path)
     notes_info, _events_df, model_df = compute_notes_info(
@@ -930,40 +1067,22 @@ def process_one_chart_row(
         beat_grid_info.total_frames,
     )
 
-    if notes_info.model_events == 0:
-        raise ChartBuildError("no_model_events", "No modeling events found after filtering event types")
-    if reject_offgrid_notes:
-        tolerance_with_epsilon = offgrid_tolerance_ms + 1e-9
-        offgrid_df = model_df[model_df["offgrid_abs_error_ms"] > tolerance_with_epsilon]
-        if not offgrid_df.empty:
-            max_deviation_ms = float(offgrid_df["offgrid_abs_error_ms"].max())
-            raise ChartBuildError(
-                "off_grid_notes",
-                f"Found {len(offgrid_df)} off-grid model notes (> {offgrid_tolerance_ms:.3f} ms); "
-                f"max deviation={max_deviation_ms:.3f} ms",
-            )
-    if notes_info.outside_event_count > 0:
-        raise ChartBuildError(
-            "outside_grid_notes",
-            f"Found {notes_info.outside_event_count} note events outside frame grid",
-        )
-    if notes_info.collision_frame_count > 0:
-        raise ChartBuildError("collision_frames", f"Found {notes_info.collision_frame_count} collision frames")
-    if beat_grid_info.total_sequences == 0:
-        raise ChartBuildError("no_sequences", "No full 4-beat sequences available")
+    enforce_chart_filter_policy(
+        notes_info,
+        model_df,
+        beat_grid_info,
+        reject_offgrid_notes=reject_offgrid_notes,
+        offgrid_tolerance_ms=offgrid_tolerance_ms,
+    )
 
     frame_times_ms = build_beat_aligned_frame_timeline(
         timing_info.offset_ms,
         timing_info.beat_duration_ms,
         beat_grid_info.total_frames,
     )
-    mel_spec_db, orig_frame_times_ms = build_raw_mel_spectrogram(
-        audio_info["waveform"],
-        audio_info["sample_rate"],
-    )
     aligned_mel_db = interpolate_raw_mel_to_beat_aligned_timeline(
-        mel_spec_db,
-        orig_frame_times_ms,
+        shared_audio_artifact["mel_spec_db"],
+        shared_audio_artifact["orig_frame_times_ms"],
         frame_times_ms,
     )
     audio_sequences = segment_aligned_mel_into_4beat_sequences(
@@ -1009,7 +1128,12 @@ def process_one_chart_row(
                 "n_events": seq["n_events"],
                 "n_tokens": seq["n_tokens"],
                 "audio_npz_path": str(audio_npz_dir / f"{chart_id}.npz"),
+                "shared_audio_id": shared_audio_artifact["shared_audio_id"],
+                "shared_audio_npz_path": str(shared_audio_artifact["shared_audio_npz_path"]),
                 "token_json_path": str(token_json_dir / f"{chart_id}.json"),
+                "offset_ms": timing_info.offset_ms,
+                "beat_duration_ms": timing_info.beat_duration_ms,
+                "total_frames": beat_grid_info.total_frames,
             }
         )
 
@@ -1028,7 +1152,11 @@ def process_one_chart_row(
         "error_type": "",
         "error_detail": "",
         "error_message": "",
+        "filter_type": "",
+        "filter_detail": "",
         "audio_path": str(audio_path),
+        "shared_audio_id": shared_audio_artifact["shared_audio_id"],
+        "shared_audio_npz_path": str(shared_audio_artifact["shared_audio_npz_path"]),
         "notes_path": str(notes_path),
         "timing_path": str(timing_path),
         "metadata_path": str(metadata_path),
@@ -1036,7 +1164,7 @@ def process_one_chart_row(
         "beat_duration_ms": timing_info.beat_duration_ms,
         "bpm": timing_info.bpm,
         "meter": timing_info.meter,
-        "audio_duration_ms": audio_info["audio_duration_ms"],
+        "audio_duration_ms": shared_audio_artifact["audio_duration_ms"],
         "total_beats": beat_grid_info.total_beats,
         "total_frames": beat_grid_info.total_frames,
         "total_sequences": beat_grid_info.total_sequences,
@@ -1079,6 +1207,8 @@ def load_existing_chart_summary_cache(chart_summary_csv: Path) -> Dict[str, Dict
         row.setdefault("error_type", "")
         row.setdefault("error_detail", "")
         row.setdefault("error_message", "")
+        row.setdefault("filter_type", "")
+        row.setdefault("filter_detail", "")
         row.setdefault("n_bpm_points", np.nan)
         row.setdefault("unique_uninherited_mpb_count", np.nan)
         row.setdefault("unique_uninherited_mpb_preview", "")
@@ -1132,8 +1262,10 @@ def run_pipeline(
     ensure_dir(index_dir)
     ensure_dir(dataset_dir)
     audio_npz_dir = dataset_dir / "audio_npz"
+    audio_shared_npz_dir = dataset_dir / "audio_shared_npz"
     token_json_dir = dataset_dir / "token_json"
     ensure_dir(audio_npz_dir)
+    ensure_dir(audio_shared_npz_dir)
     ensure_dir(token_json_dir)
 
     logging.info("Building internal chart mapping table...")
@@ -1169,7 +1301,9 @@ def run_pipeline(
     sequence_metadata_rows: List[Dict[str, Any]] = []
     processed_count = 0
     cached_skipped_count = 0
+    filtered_count = 0
     failed_count = 0
+    shared_audio_cache: Dict[str, Dict[str, Any]] = {}
 
     total_rows = len(mapping_df)
     for i, (_, row) in enumerate(mapping_df.iterrows(), start=1):
@@ -1197,13 +1331,20 @@ def run_pipeline(
                 dataset_dir,
                 reject_offgrid_notes=reject_offgrid_notes,
                 offgrid_tolerance_ms=offgrid_tolerance_ms,
+                overwrite_dataset_outputs=overwrite_dataset_outputs,
+                shared_audio_cache=shared_audio_cache,
             )
             chart_summaries.append(result["summary"])
             sequence_metadata_rows.extend(result["sequence_metadata"])
             processed_count += 1
         except Exception as exc:
-            logging.error("Failed on %s | %s", chart_label, exc)
-            error_type, error_detail = classify_processing_error(exc)
+            outcome = classify_chart_exception(exc)
+            if outcome["status"] == "filtered":
+                logging.info("Filtered chart %s | %s", chart_label, outcome["filter_detail"])
+                filtered_count += 1
+            else:
+                logging.error("Failed on %s | %s", chart_label, exc)
+                failed_count += 1
             timing_diagnostics = (
                 dict(exc.diagnostics)
                 if isinstance(exc, ChartBuildError)
@@ -1214,11 +1355,15 @@ def run_pipeline(
                     "chart_id": chart_id,
                     "folder_id": row["folder_id"],
                     "chart_base": row["chart_base"],
-                    "status": "error",
-                    "error_type": error_type,
-                    "error_detail": error_detail,
-                    "error_message": error_detail,
+                    "status": outcome["status"],
+                    "error_type": outcome["error_type"],
+                    "error_detail": outcome["error_detail"],
+                    "error_message": outcome["error_message"],
+                    "filter_type": outcome["filter_type"],
+                    "filter_detail": outcome["filter_detail"],
                     "audio_path": row["audio_path"],
+                    "shared_audio_id": shared_audio_uid(Path(row["audio_path"])),
+                    "shared_audio_npz_path": str(audio_shared_npz_dir / f"{shared_audio_uid(Path(row['audio_path']))}.npz"),
                     "notes_path": row["notes_path"],
                     "timing_path": row["timing_path"],
                     "metadata_path": row["metadata_path"],
@@ -1227,7 +1372,6 @@ def run_pipeline(
                     "unique_uninherited_mpb_preview": timing_diagnostics.get("unique_uninherited_mpb_preview", ""),
                 }
             )
-            failed_count += 1
             continue
 
     chart_summary_df = pd.DataFrame(chart_summaries)
@@ -1237,14 +1381,31 @@ def run_pipeline(
     sequence_metadata_df.to_csv(sequence_metadata_csv, index=False, encoding="utf-8-sig")
 
     ok_count = int((chart_summary_df["status"] == "ok").sum()) if not chart_summary_df.empty else 0
+    filtered_status_count = int((chart_summary_df["status"] == "filtered").sum()) if not chart_summary_df.empty else 0
     error_count = int((chart_summary_df["status"] == "error").sum()) if not chart_summary_df.empty else 0
+    filter_breakdown = Counter(
+        str(v)
+        for v in chart_summary_df.loc[chart_summary_df["status"] == "filtered", "filter_type"].tolist()
+        if str(v).strip()
+    ) if not chart_summary_df.empty and "filter_type" in chart_summary_df.columns else Counter()
+    error_breakdown = Counter(
+        str(v)
+        for v in chart_summary_df.loc[chart_summary_df["status"] == "error", "error_type"].tolist()
+        if str(v).strip()
+    ) if not chart_summary_df.empty and "error_type" in chart_summary_df.columns else Counter()
 
     logging.info("Pipeline finished")
     logging.info("Charts processed (newly built): %d", processed_count)
     logging.info("Charts cached (skipped rebuild): %d", cached_skipped_count)
+    logging.info("Charts filtered this run: %d", filtered_count)
     logging.info("Charts failed this run: %d", failed_count)
     logging.info("Charts succeeded: %d", ok_count)
+    logging.info("Charts filtered: %d", filtered_status_count)
     logging.info("Charts failed: %d", error_count)
+    if filter_breakdown:
+        logging.info("Filter breakdown: %s", ", ".join(f"{k}={v}" for k, v in sorted(filter_breakdown.items())))
+    if error_breakdown:
+        logging.info("Error breakdown: %s", ", ".join(f"{k}={v}" for k, v in sorted(error_breakdown.items())))
     logging.info("Mapping CSV saved to: %s", mapping_csv)
     logging.info("Chart summary saved to: %s", chart_summary_csv)
     logging.info("Sequence metadata saved to: %s", sequence_metadata_csv)
