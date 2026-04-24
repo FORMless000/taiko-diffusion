@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "id": "sample_large_context",
+      "label": "Sample Large Context",
+      "checkpoint_path": "checkpoints/sample_large_context/last.ckpt",
+      "architecture_name": "taiko_context_transformer"
+    },
+    {
+      "id": "sample_large_baseline",
+      "label": "Sample Large Baseline",
+      "checkpoint_path": "checkpoints/sample_large_baseline/last.ckpt",
+      "architecture_name": "taiko_transformer"
+    },
+    {
+      "id": "sample_large_baseline_maxopt",
+      "label": "Sample Large Baseline Maxopt",
+      "checkpoint_path": "checkpoints/sample_large_baseline_maxopt/last.ckpt",
+      "architecture_name": "taiko_transformer"
+    }
+  ]
+}

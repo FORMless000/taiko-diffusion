@@ -117,6 +117,38 @@ class TestContextDataset(unittest.TestCase):
             expected = dataset._serialize_window_token_ids([3, 7, 4], limit=8)
             self.assertEqual(retrieved_ids, expected)
 
+    def test_context_prefixes_are_precomputed_in_chart_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chart_id, seq_index = self._write_chart(Path(tmpdir))
+            token_to_id = {
+                "PAD": 0,
+                "BOS": 1,
+                "EOS": 2,
+                "DON": 3,
+                "KAT": 4,
+                "BIGDON": 5,
+                "BIGKAT": 6,
+                "TS_2": 7,
+            }
+
+            dataset = TaikoContextDataset(
+                seq_index,
+                token_to_id,
+                history_max_tokens=32,
+                retrieval_top_k=1,
+                retrieval_max_tokens_per_window=8,
+                retrieval_exclude_last_n_windows=1,
+                use_motif_retrieval=True,
+            )
+
+            payload = dataset._load_chart_samples(chart_id)
+            self.assertIn("prefix_by_seq", payload)
+            self.assertIn("conditioning_by_seq", payload)
+            self.assertIn(3, payload["prefix_by_seq"])
+            self.assertIn("input_prefix", payload["prefix_by_seq"][3])
+            self.assertIn("label_prefix", payload["prefix_by_seq"][3])
+            self.assertIn("segment_prefix", payload["prefix_by_seq"][3])
+
     def test_context_chart_cache_is_bounded_lru(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

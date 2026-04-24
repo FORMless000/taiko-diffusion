@@ -1,6 +1,8 @@
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
+import time
+from contextlib import nullcontext
 from typing import Any, Callable
 
 
@@ -53,11 +55,18 @@ def train_one_epoch(
     log_every_n_batches: int | None = None,
     epoch: int | None = None,
     global_step_start: int = 0,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+    grad_scaler: Any = None,
+    batch_callback: Callable[[dict[str, Any]], None] | None = None,
 ):
     model.train()
 
     total_loss = 0.0
     total_batches = 0
+    total_batch_time = 0.0
+    total_samples = 0
+    total_tokens = 0
     total_density_error = 0.0
     total_difficulty_drift = 0.0
     pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -71,6 +80,7 @@ def train_one_epoch(
         ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
     for batch_idx, batch in enumerate(pbar, start=1):
+        batch_start = time.perf_counter()
         audio = batch["audio"].to(device)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -92,11 +102,30 @@ def train_one_epoch(
         if "segment_ids" in batch:
             model_inputs["segment_ids"] = batch["segment_ids"].to(device)
 
-        logits = model(**model_inputs)
+        use_autocast = (
+            autocast_device_type is not None
+            and autocast_dtype is not None
+        )
+        autocast_ctx = (
+            torch.autocast(
+                device_type=autocast_device_type,
+                dtype=autocast_dtype,
+                enabled=True,
+            )
+            if use_autocast
+            else nullcontext()
+        )
+        with autocast_ctx:
+            logits = model(**model_inputs)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
-        loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-        loss.backward()
-        optimizer.step()
+        if grad_scaler is not None:
+            grad_scaler.scale(loss).backward()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         metrics = _compute_adherence_metrics(
             logits=logits,
@@ -110,6 +139,9 @@ def train_one_epoch(
 
         total_loss += loss.item()
         total_batches += 1
+        total_batch_time += max(0.0, time.perf_counter() - batch_start)
+        total_samples += int(input_ids.size(0))
+        total_tokens += int(input_ids.numel())
         if metrics:
             total_density_error += metrics["density_proxy_abs_error"]
             total_difficulty_drift += metrics["difficulty_proxy_drift"]
@@ -139,8 +171,22 @@ def train_one_epoch(
                 payload["train/difficulty_proxy_drift"] = float(metrics["difficulty_proxy_drift"])
             metrics_logger(payload)
 
+        if batch_callback is not None:
+            batch_callback(
+                {
+                    "batch": int(batch_idx),
+                    "epoch": None if epoch is None else int(epoch),
+                    "global_step": int(global_step_start + batch_idx),
+                    "loss": float(loss.item()),
+                }
+            )
+
     avg_loss = total_loss / total_batches
     out = {"loss": avg_loss}
+    if total_batch_time > 0.0 and total_batches > 0:
+        out["avg_batch_time_sec"] = total_batch_time / total_batches
+        out["samples_per_sec"] = total_samples / total_batch_time
+        out["tokens_per_sec"] = total_tokens / total_batch_time
     if ts_token_ids is not None and total_batches > 0:
         out["density_proxy_abs_error"] = total_density_error / total_batches
         out["difficulty_proxy_drift"] = total_difficulty_drift / total_batches
@@ -159,11 +205,16 @@ def validate_one_epoch(
     log_every_n_batches: int | None = None,
     epoch: int | None = None,
     global_step_start: int = 0,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ):
     model.eval()
 
     total_loss = 0.0
     total_batches = 0
+    total_batch_time = 0.0
+    total_samples = 0
+    total_tokens = 0
     total_density_error = 0.0
     total_difficulty_drift = 0.0
     pbar = tqdm(dataloader, desc="Validation", leave=False)
@@ -177,6 +228,7 @@ def validate_one_epoch(
         ignore_index = int(adherence_config.get("ignore_index", pad_id))
 
     for batch_idx, batch in enumerate(pbar, start=1):
+        batch_start = time.perf_counter()
         audio = batch["audio"].to(device)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -196,9 +248,22 @@ def validate_one_epoch(
         if "segment_ids" in batch:
             model_inputs["segment_ids"] = batch["segment_ids"].to(device)
 
-        logits = model(**model_inputs)
-
-        loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+        use_autocast = (
+            autocast_device_type is not None
+            and autocast_dtype is not None
+        )
+        autocast_ctx = (
+            torch.autocast(
+                device_type=autocast_device_type,
+                dtype=autocast_dtype,
+                enabled=True,
+            )
+            if use_autocast
+            else nullcontext()
+        )
+        with autocast_ctx:
+            logits = model(**model_inputs)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
         metrics = _compute_adherence_metrics(
             logits=logits,
@@ -212,6 +277,9 @@ def validate_one_epoch(
 
         total_loss += loss.item()
         total_batches += 1
+        total_batch_time += max(0.0, time.perf_counter() - batch_start)
+        total_samples += int(input_ids.size(0))
+        total_tokens += int(input_ids.numel())
         if metrics:
             total_density_error += metrics["density_proxy_abs_error"]
             total_difficulty_drift += metrics["difficulty_proxy_drift"]
@@ -243,6 +311,10 @@ def validate_one_epoch(
 
     avg_loss = total_loss / total_batches
     out = {"loss": avg_loss}
+    if total_batch_time > 0.0 and total_batches > 0:
+        out["avg_batch_time_sec"] = total_batch_time / total_batches
+        out["samples_per_sec"] = total_samples / total_batch_time
+        out["tokens_per_sec"] = total_tokens / total_batch_time
     if ts_token_ids is not None and total_batches > 0:
         out["density_proxy_abs_error"] = total_density_error / total_batches
         out["difficulty_proxy_drift"] = total_difficulty_drift / total_batches

@@ -18,8 +18,10 @@ if torch is not None:
         CheckpointMetadata,
         capture_rng_states,
         load_checkpoint,
+        load_inference_artifacts,
         restore_rng_states,
         save_checkpoint,
+        save_inference_bundle,
     )
     from src.model.factory import build_model
     from src.model.specs import ArchitectureSpec, TrainingSpec
@@ -202,6 +204,94 @@ class TestCheckpoints(unittest.TestCase):
             self.assertEqual(payload["metadata"]["epoch"], 1)
             tmp_files = list(root.glob(".atomic.ckpt.*.tmp"))
             self.assertEqual(tmp_files, [])
+
+    def test_save_inference_bundle_is_minimal_and_loadable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = root / "snapshots" / "step_001000.pt"
+
+            spec = ArchitectureSpec(
+                d_model=16,
+                nhead=4,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                dim_feedforward=32,
+                max_len=32,
+            )
+            model = build_model(spec, vocab_size=8)
+            vocab = {
+                "vocab_list": ["PAD", "BOS", "EOS", "DON"],
+                "token_to_id": {"PAD": 0, "BOS": 1, "EOS": 2, "DON": 3},
+                "id_to_token": {0: "PAD", 1: "BOS", 2: "EOS", 3: "DON"},
+            }
+
+            save_inference_bundle(
+                bundle_path,
+                model=model,
+                architecture_spec=spec,
+                vocab=vocab,
+                global_step=1000,
+                epoch=2,
+                adherence_config={"pad_id": 0, "ts_token_ids": []},
+                metadata={"source": "unit_test"},
+            )
+
+            raw_payload = load_checkpoint(bundle_path, map_location="cpu")
+            self.assertEqual(raw_payload["artifact_type"], "inference_bundle")
+            self.assertNotIn("optimizer_state_dict", raw_payload)
+            self.assertNotIn("scheduler_state_dict", raw_payload)
+            self.assertNotIn("rng_state", raw_payload)
+
+            inference_payload = load_inference_artifacts(bundle_path, map_location="cpu")
+            self.assertEqual(inference_payload["metadata"]["global_step"], 1000)
+            self.assertEqual(inference_payload["metadata"]["epoch"], 2)
+            self.assertEqual(inference_payload["vocab"]["token_to_id"], vocab["token_to_id"])
+
+    def test_load_inference_artifacts_accepts_full_training_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ckpt_path = root / "last.ckpt"
+
+            spec = ArchitectureSpec(
+                d_model=16,
+                nhead=4,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                dim_feedforward=32,
+                max_len=32,
+            )
+            train_spec = TrainingSpec(epochs=1, batch_size=2, lr=1e-3, device="cpu")
+            model = build_model(spec, vocab_size=8)
+            optimizer = torch.optim.Adam(model.parameters(), lr=train_spec.lr)
+            vocab = {
+                "vocab_list": ["PAD", "BOS", "EOS", "DON"],
+                "token_to_id": {"PAD": 0, "BOS": 1, "EOS": 2, "DON": 3},
+                "id_to_token": {0: "PAD", 1: "BOS", 2: "EOS", 3: "DON"},
+            }
+
+            save_checkpoint(
+                ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                architecture_spec=spec,
+                training_spec=train_spec,
+                metadata=CheckpointMetadata(
+                    epoch=1,
+                    global_step=4,
+                    best_val_loss=0.1,
+                    data_root=str(root),
+                    artifact_paths={"audio_dir": "beat_aligned_dataset/audio_npz"},
+                ),
+                history={"train_loss": [1.0], "val_loss": [0.5], "lr": [1e-3]},
+                vocab=vocab,
+                split_ids={"train": ["a"], "val": ["b"], "test": ["c"]},
+                adherence_config={"pad_id": 0, "ts_token_ids": []},
+            )
+
+            inference_payload = load_inference_artifacts(ckpt_path, map_location="cpu")
+            self.assertEqual(inference_payload["artifact_type"], "training_checkpoint")
+            self.assertEqual(inference_payload["metadata"]["global_step"], 4)
+            self.assertEqual(inference_payload["vocab"]["token_to_id"], vocab["token_to_id"])
 
 
 if __name__ == "__main__":

@@ -30,7 +30,9 @@ from .checkpoints import (
     capture_rng_states,
     restore_rng_states,
     save_checkpoint,
+    save_inference_bundle,
     load_checkpoint,
+    load_inference_artifacts,
 )
 from .train_api import (
     TrainingArtifacts,
@@ -66,6 +68,13 @@ from .wandb_utils import (
     WandbConfig,
     WandbRuntime,
     setup_wandb_runtime,
+)
+from .runtime import (
+    PrecisionRuntime,
+    normalize_precision,
+    resolve_precision_runtime,
+    build_grad_scaler,
+    build_dataloader_runtime_kwargs,
 )
 
 try:
@@ -105,7 +114,9 @@ __all__ = [
     "capture_rng_states",
     "restore_rng_states",
     "save_checkpoint",
+    "save_inference_bundle",
     "load_checkpoint",
+    "load_inference_artifacts",
     "TrainingArtifacts",
     "DatasetBundle",
     "TrainingContext",
@@ -131,6 +142,11 @@ __all__ = [
     "WandbConfig",
     "WandbRuntime",
     "setup_wandb_runtime",
+    "PrecisionRuntime",
+    "normalize_precision",
+    "resolve_precision_runtime",
+    "build_grad_scaler",
+    "build_dataloader_runtime_kwargs",
 ]
 
 if SamplingConfig is not None:

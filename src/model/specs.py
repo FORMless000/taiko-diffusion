@@ -28,9 +28,9 @@ class ArchitectureSpec:
     dim_feedforward: int = 1024
     dropout: float = 0.1
     max_len: int = 512
-    history_max_tokens: int = 1024
-    retrieval_top_k: int = 2
-    retrieval_max_tokens_per_window: int = 64
+    history_max_tokens: int = 256
+    retrieval_top_k: int = 1
+    retrieval_max_tokens_per_window: int = 24
     retrieval_exclude_last_n_windows: int = 2
     use_motif_retrieval: bool = True
     max_cached_charts: int = 4
@@ -100,6 +100,22 @@ class TrainingSpec:
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     num_workers: int = 0
+    precision: str = "auto"
+    pin_memory: bool | None = None
+    persistent_workers: bool | None = None
+    prefetch_factor: int | None = None
+
+    def __post_init__(self) -> None:
+        self.num_workers = max(0, int(self.num_workers))
+        self.precision = str(self.precision or "auto").strip().lower()
+        if self.precision not in {"auto", "fp32", "bf16", "fp16"}:
+            raise ValueError(f"Unsupported precision '{self.precision}'.")
+        if self.pin_memory is not None:
+            self.pin_memory = bool(self.pin_memory)
+        if self.persistent_workers is not None:
+            self.persistent_workers = bool(self.persistent_workers)
+        if self.prefetch_factor is not None:
+            self.prefetch_factor = max(1, int(self.prefetch_factor))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

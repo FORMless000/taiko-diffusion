@@ -20,6 +20,7 @@ from .data import (
     split_chart_manifest,
 )
 from .factory import build_model
+from .runtime import build_dataloader_runtime_kwargs, build_grad_scaler, resolve_precision_runtime
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
 from .wandb_utils import WandbConfig, setup_wandb_runtime
@@ -213,15 +214,30 @@ def _build_architecture_spec(args: argparse.Namespace, checkpoint_payload: dict[
             dim_feedforward=args.dim_feedforward,
             dropout=args.dropout,
             max_len=args.max_len,
-            history_max_tokens=args.history_max_tokens,
-            retrieval_top_k=args.retrieval_top_k,
-            retrieval_max_tokens_per_window=args.retrieval_max_tokens_per_window,
-            retrieval_exclude_last_n_windows=args.retrieval_exclude_last_n_windows,
-            use_motif_retrieval=args.use_motif_retrieval,
         )
 
+    context_fields_changed = False
+    if args.history_max_tokens is not None:
+        spec.history_max_tokens = max(1, int(args.history_max_tokens))
+        context_fields_changed = True
+    if args.retrieval_top_k is not None:
+        spec.retrieval_top_k = max(0, int(args.retrieval_top_k))
+        context_fields_changed = True
+    if args.retrieval_max_tokens_per_window is not None:
+        spec.retrieval_max_tokens_per_window = max(1, int(args.retrieval_max_tokens_per_window))
+        context_fields_changed = True
+    if args.retrieval_exclude_last_n_windows is not None:
+        spec.retrieval_exclude_last_n_windows = max(0, int(args.retrieval_exclude_last_n_windows))
+        context_fields_changed = True
+    if args.use_motif_retrieval is not None:
+        spec.use_motif_retrieval = bool(args.use_motif_retrieval)
+        context_fields_changed = True
     if args.max_cached_charts is not None:
         spec.max_cached_charts = max(1, int(args.max_cached_charts))
+
+    if context_fields_changed and str(spec.name).strip() == "taiko_context_transformer":
+        spec.max_len = max(int(spec.max_len), int(spec.required_context_max_len()))
+
     return spec
 
 
@@ -238,6 +254,10 @@ def _build_training_spec(args: argparse.Namespace, checkpoint_payload: dict[str,
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             num_workers=args.num_workers,
+            precision=("auto" if args.precision is None else args.precision),
+            pin_memory=args.pin_memory,
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
         )
 
     saved = TrainingSpec.from_dict(checkpoint_payload["training_spec"])
@@ -247,6 +267,14 @@ def _build_training_spec(args: argparse.Namespace, checkpoint_payload: dict[str,
     saved.batch_size = args.batch_size
     saved.device = args.device
     saved.num_workers = args.num_workers
+    if args.precision is not None:
+        saved.precision = args.precision
+    if args.pin_memory is not None:
+        saved.pin_memory = bool(args.pin_memory)
+    if args.persistent_workers is not None:
+        saved.persistent_workers = bool(args.persistent_workers)
+    if args.prefetch_factor is not None:
+        saved.prefetch_factor = max(1, int(args.prefetch_factor))
     return saved
 
 
@@ -309,12 +337,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dim-feedforward", type=int, default=1024, help="Transformer feedforward width.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout.")
     parser.add_argument("--max-len", type=int, default=512, help="Maximum modeled sequence length.")
-    parser.add_argument("--history-max-tokens", type=int, default=1024, help="Recent exact-history budget for the context transformer.")
-    parser.add_argument("--retrieval-top-k", type=int, default=2, help="How many prior windows to retrieve for motif reuse.")
-    parser.add_argument("--retrieval-max-tokens-per-window", type=int, default=64, help="Maximum retrieved tokens to prepend for each prior window.")
-    parser.add_argument("--retrieval-exclude-last-n-windows", type=int, default=2, help="Skip the most recent windows when retrieving repeated motifs.")
-    parser.add_argument("--use-motif-retrieval", action=argparse.BooleanOptionalAction, default=True, help="Enable audio-similarity motif retrieval for the context transformer.")
+    parser.add_argument("--history-max-tokens", type=int, default=None, help="Recent exact-history budget for the context transformer. Fresh runs use architecture defaults; resume keeps checkpoint unless explicitly set.")
+    parser.add_argument("--retrieval-top-k", type=int, default=None, help="How many prior windows to retrieve for motif reuse. Fresh runs use architecture defaults; resume keeps checkpoint unless explicitly set.")
+    parser.add_argument("--retrieval-max-tokens-per-window", type=int, default=None, help="Maximum retrieved tokens to prepend for each prior window. Fresh runs use architecture defaults; resume keeps checkpoint unless explicitly set.")
+    parser.add_argument("--retrieval-exclude-last-n-windows", type=int, default=None, help="Skip the most recent windows when retrieving repeated motifs. Fresh runs use architecture defaults; resume keeps checkpoint unless explicitly set.")
+    parser.add_argument("--use-motif-retrieval", action=argparse.BooleanOptionalAction, default=None, help="Enable audio-similarity motif retrieval for the context transformer. Fresh runs use architecture defaults; resume keeps checkpoint unless explicitly set.")
     parser.add_argument("--max-cached-charts", type=int, default=None, help="Cap the number of chart payloads cached in the context dataset.")
+    parser.add_argument("--precision", choices=["auto", "fp32", "bf16", "fp16"], default=None, help="Autocast precision mode. Defaults to auto for new runs; resume keeps checkpoint precision unless set.")
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None, help="Enable pinned host memory for DataLoaders. Default auto on CUDA.")
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=None, help="Keep DataLoader workers persistent between epochs when num_workers>0.")
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="DataLoader prefetch factor when num_workers>0 (default: 2).")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-run-name", default="default", help="Run-name tag used in the W&B run name.")
     parser.add_argument("--wandb-log-every-batches", type=int, default=100, help="Log batch metrics to W&B every N batches.")
@@ -432,25 +464,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         token_to_id,
         architecture_spec,
     )
+    resolved_device = torch.device(training_spec.device)
+    dataloader_kwargs = build_dataloader_runtime_kwargs(training_spec, resolved_device)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=training_spec.batch_size,
         shuffle=True,
-        num_workers=training_spec.num_workers,
         collate_fn=collate,
+        **dataloader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=training_spec.batch_size,
         shuffle=False,
-        num_workers=training_spec.num_workers,
         collate_fn=collate,
+        **dataloader_kwargs,
     )
 
     model = build_model(architecture_spec, vocab_size=len(token_to_id))
-    device = torch.device(training_spec.device)
+    device = resolved_device
     model = model.to(device)
+    precision_runtime = resolve_precision_runtime(training_spec.precision, device)
+    grad_scaler = build_grad_scaler(precision_runtime)
+    if precision_runtime.fallback_reason:
+        print(f"[runtime] precision fallback: {precision_runtime.fallback_reason}")
+    print(
+        "[runtime] precision "
+        f"requested={precision_runtime.requested} resolved={precision_runtime.resolved} "
+        f"autocast={int(precision_runtime.autocast_enabled)} scaler={int(precision_runtime.scaler_enabled)}"
+    )
+    if str(architecture_spec.name).strip() == "taiko_context_transformer":
+        print(
+            "[runtime] context_budget "
+            f"history_max_tokens={int(getattr(architecture_spec, 'history_max_tokens', 256))} "
+            f"retrieval_top_k={int(getattr(architecture_spec, 'retrieval_top_k', 1))} "
+            f"retrieval_max_tokens_per_window={int(getattr(architecture_spec, 'retrieval_max_tokens_per_window', 24))} "
+            f"retrieval_exclude_last_n_windows={int(getattr(architecture_spec, 'retrieval_exclude_last_n_windows', 2))} "
+            f"use_motif_retrieval={int(bool(getattr(architecture_spec, 'use_motif_retrieval', True)))}"
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -508,6 +560,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_every_n_batches=args.wandb_log_every_batches,
             epoch=epoch,
             global_step_start=global_step,
+            autocast_device_type=(device.type if precision_runtime.autocast_enabled else None),
+            autocast_dtype=precision_runtime.autocast_dtype,
+            grad_scaler=grad_scaler,
         )
         val_stats = validate_one_epoch(
             model=model,
@@ -519,6 +574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_every_n_batches=args.wandb_log_every_batches,
             epoch=epoch,
             global_step_start=global_step + len(train_loader),
+            autocast_device_type=(device.type if precision_runtime.autocast_enabled else None),
+            autocast_dtype=precision_runtime.autocast_dtype,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -527,7 +584,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(
             f"Epoch {epoch}/{training_spec.epochs} | lr: {current_lr:.6f} | "
-            f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f}"
+            f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f} | "
+            f"train samp/s: {float(train_stats.get('samples_per_sec', 0.0)):.2f} | "
+            f"train tok/s: {float(train_stats.get('tokens_per_sec', 0.0)):.2f}"
         )
         if "density_proxy_abs_error" in train_stats:
             print(
@@ -591,6 +650,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "global_step": int(global_step),
                 "train/loss_epoch": float(train_stats["loss"]),
                 "val/loss_epoch": float(val_stats["loss"]),
+                "train/avg_batch_time_sec": float(train_stats.get("avg_batch_time_sec", 0.0)),
+                "train/samples_per_sec": float(train_stats.get("samples_per_sec", 0.0)),
+                "train/tokens_per_sec": float(train_stats.get("tokens_per_sec", 0.0)),
+                "val/avg_batch_time_sec": float(val_stats.get("avg_batch_time_sec", 0.0)),
+                "val/samples_per_sec": float(val_stats.get("samples_per_sec", 0.0)),
+                "val/tokens_per_sec": float(val_stats.get("tokens_per_sec", 0.0)),
                 "optimizer/lr": float(current_lr),
                 "checkpoint/last_path": str((checkpoints_dir / "last.ckpt").resolve()),
                 "checkpoint/best_updated": int(best_updated),

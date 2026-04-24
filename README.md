@@ -172,11 +172,42 @@ You can also pass API key directly by parameter (no environment setup), e.g. `--
 
 - [`src/preprocessing`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing): unpacking, parsing, reconstruction, and beat-aligned dataset building
 - [`src/model`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model): transformer baseline, data utilities, training loop, and generation helpers
+- [`src/inference`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference): checkpoint-backed inference helpers, metadata-driven generation service, and `.osz` packaging
+- [`webapp`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/webapp): FastAPI backend, Next.js frontend, and runtime job workspace for deployment
 - [`sample_data`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/sample_data): small local examples for parser/reconstruction work
 - notebooks: exploratory and milestone notebooks for preprocessing, dataset creation, analysis, and modeling
+
+## Web App
+
+The repo now includes a deployable web app under [`webapp`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/webapp).
+
+- The backend is a FastAPI app with a single-worker queue and file-backed job store.
+- The frontend is a Next.js app that submits generation jobs, polls status, and downloads the generated `.osz`.
+- The reusable generation service lives in [`src/inference/service.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference/service.py) so the backend calls Python library code directly instead of shelling out to notebooks or CLI scripts.
+
+Install the optional backend dependencies:
+
+```bash
+pip install -e .[webapp]
+```
+
+Build the frontend:
+
+```bash
+cd webapp/frontend
+npm install
+npm run build
+```
+
+Run the backend:
+
+```bash
+python -m webapp.backend.main
+```
 
 ## Current Limitations
 
 - The current beat-aligned dataset builder only supports constant-BPM charts; charts with BPM changes are rejected during dataset creation.
+- The metadata-driven inference and web app currently support only constant-BPM timing payloads.
 - Several notebooks and scripts still use machine-specific absolute paths and are not yet packaged as a clean end-to-end CLI workflow.
 - The implemented model is currently a transformer baseline; diffusion training/inference is still future work.

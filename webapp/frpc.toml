@@ -1,0 +1,9 @@
+serverAddr = "18.117.249.161"
+serverPort = 7000
+
+[[proxies]]
+name = "taiko-diffusion-backend"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 12205
+remotePort = 12205

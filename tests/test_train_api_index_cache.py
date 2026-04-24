@@ -93,6 +93,8 @@ class TestTrainApiIndexCache(unittest.TestCase):
             )
             self.assertEqual(len(bundle.train_seq_index), 1)
             self.assertEqual(getattr(bundle.train_loader.dataset, "max_cached_charts", None), 2)
+            self.assertEqual(int(bundle.train_loader.num_workers), 0)
+            self.assertFalse(bool(bundle.train_loader.pin_memory))
             cache_entries = [p for p in cache_dir.glob("*") if p.is_dir()]
             self.assertEqual(len(cache_entries), 1)
 

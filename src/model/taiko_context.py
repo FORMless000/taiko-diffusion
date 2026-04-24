@@ -17,9 +17,9 @@ class TaikoContextTransformer(TaikoTransformer):
         dim_feedforward=1024,
         dropout=0.1,
         max_len=1536,
-        history_max_tokens=1024,
-        retrieval_top_k=2,
-        retrieval_max_tokens_per_window=64,
+        history_max_tokens=256,
+        retrieval_top_k=1,
+        retrieval_max_tokens_per_window=24,
         retrieval_exclude_last_n_windows=2,
         use_motif_retrieval=True,
     ):

@@ -616,9 +616,9 @@ class TaikoContextDataset(Dataset):
         self,
         seq_index_df,
         token_to_id,
-        history_max_tokens=1024,
-        retrieval_top_k=2,
-        retrieval_max_tokens_per_window=64,
+        history_max_tokens=256,
+        retrieval_top_k=1,
+        retrieval_max_tokens_per_window=24,
         retrieval_exclude_last_n_windows=2,
         use_motif_retrieval=True,
         max_cached_charts=4,
@@ -635,9 +635,10 @@ class TaikoContextDataset(Dataset):
         self.eos_id = int(token_to_id["EOS"])
         self.ts_token_ids = {int(idx) for tok, idx in token_to_id.items() if str(tok).startswith("TS_")}
 
+        self._rows = [row.to_dict() for _, row in self.seq_index_df.iterrows()]
+
         self._chart_rows = {}
-        for _, row in self.seq_index_df.iterrows():
-            row_dict = row.to_dict()
+        for row_dict in self._rows:
             chart_id = row_dict["chart_id"]
             self._chart_rows.setdefault(chart_id, []).append(row_dict)
 
@@ -647,7 +648,7 @@ class TaikoContextDataset(Dataset):
         self._chart_cache = OrderedDict()
 
     def __len__(self):
-        return len(self.seq_index_df)
+        return len(self._rows)
 
     def _build_sequence_assets(self, seq_idx, audio_arr, token_data):
         tokens = token_data[seq_idx]["tokens"]
@@ -660,6 +661,8 @@ class TaikoContextDataset(Dataset):
         return {
             "seq_idx": seq_idx,
             "token_ids": token_ids,
+            "current_input_ids": [self.bos_id] + list(token_ids),
+            "current_labels": list(token_ids) + [self.eos_id],
             "audio_key": audio_key.astype(np.float32, copy=False),
         }
 
@@ -708,13 +711,44 @@ class TaikoContextDataset(Dataset):
 
         ordered = []
         by_seq = {}
+        row_by_seq = {}
         for row in rows:
             seq_idx = int(row["seq_idx"])
             sample = self._build_sequence_assets(seq_idx, audio_arr, token_data)
             ordered.append(sample)
             by_seq[seq_idx] = sample
+            row_by_seq[seq_idx] = row
 
-        payload = {"ordered": ordered, "by_seq": by_seq, "audio_arr": audio_arr}
+        prefix_by_seq = {}
+        conditioning_by_seq = {}
+        history_stream = []
+        for sample in ordered:
+            sample_seq_idx = int(sample["seq_idx"])
+            history_ids = list(history_stream)
+            retrieved_ids = self._build_retrieved_ids(ordered, sample)
+            input_prefix = history_ids + retrieved_ids
+            prefix_len = len(input_prefix)
+            prefix_by_seq[sample_seq_idx] = {
+                "input_prefix": input_prefix,
+                "label_prefix": [CONTEXT_LABEL_IGNORE_INDEX] * prefix_len,
+                "segment_prefix": [0] * len(history_ids) + [1] * len(retrieved_ids),
+            }
+            conditioning_by_seq[sample_seq_idx] = self._conditioning_from_row(
+                row_by_seq[sample_seq_idx],
+                sample["token_ids"],
+            )
+
+            history_stream.extend(self._serialize_window_token_ids(sample["token_ids"]))
+            if len(history_stream) > self.history_max_tokens:
+                history_stream = history_stream[-self.history_max_tokens :]
+
+        payload = {
+            "ordered": ordered,
+            "by_seq": by_seq,
+            "audio_arr": audio_arr,
+            "prefix_by_seq": prefix_by_seq,
+            "conditioning_by_seq": conditioning_by_seq,
+        }
         self._cache_put(chart_id, payload)
         return payload
 
@@ -771,27 +805,18 @@ class TaikoContextDataset(Dataset):
         return retrieved_ids
 
     def __getitem__(self, idx):
-        row = self.seq_index_df.iloc[idx].to_dict()
+        row = self._rows[idx]
         chart_payload = self._load_chart_samples(row["chart_id"])
         current_seq_idx = int(row["seq_idx"])
         current_sample = chart_payload["by_seq"][current_seq_idx]
-        current_token_ids = list(current_sample["token_ids"])
-        current_input_ids = [self.bos_id] + current_token_ids
-        current_labels = current_token_ids + [self.eos_id]
-        history_ids = self._build_recent_history_ids(chart_payload["ordered"], current_sample["seq_idx"])
-        retrieved_ids = self._build_retrieved_ids(chart_payload["ordered"], current_sample)
-        conditioning = self._conditioning_from_row(row, current_token_ids)
+        prefix = chart_payload["prefix_by_seq"][current_seq_idx]
+        conditioning = chart_payload["conditioning_by_seq"][current_seq_idx]
 
-        input_ids = history_ids + retrieved_ids + current_input_ids
-        labels = (
-            [CONTEXT_LABEL_IGNORE_INDEX] * (len(history_ids) + len(retrieved_ids))
-            + current_labels
-        )
-        segment_ids = (
-            [0] * len(history_ids)
-            + [1] * len(retrieved_ids)
-            + [2] * len(current_input_ids)
-        )
+        current_input_ids = list(current_sample["current_input_ids"])
+        current_labels = list(current_sample["current_labels"])
+        input_ids = list(prefix["input_prefix"]) + current_input_ids
+        labels = list(prefix["label_prefix"]) + current_labels
+        segment_ids = list(prefix["segment_prefix"]) + [2] * len(current_input_ids)
 
         return {
             "audio": torch.tensor(chart_payload["audio_arr"][current_seq_idx], dtype=torch.float32),
@@ -873,9 +898,9 @@ def build_dataset_for_spec(seq_index_df, token_to_id, architecture_spec):
         dataset = TaikoContextDataset(
             seq_index_df=seq_index_df,
             token_to_id=token_to_id,
-            history_max_tokens=getattr(architecture_spec, "history_max_tokens", 1024),
-            retrieval_top_k=getattr(architecture_spec, "retrieval_top_k", 2),
-            retrieval_max_tokens_per_window=getattr(architecture_spec, "retrieval_max_tokens_per_window", 64),
+            history_max_tokens=getattr(architecture_spec, "history_max_tokens", 256),
+            retrieval_top_k=getattr(architecture_spec, "retrieval_top_k", 1),
+            retrieval_max_tokens_per_window=getattr(architecture_spec, "retrieval_max_tokens_per_window", 24),
             retrieval_exclude_last_n_windows=getattr(architecture_spec, "retrieval_exclude_last_n_windows", 2),
             use_motif_retrieval=getattr(architecture_spec, "use_motif_retrieval", True),
             max_cached_charts=dataset_context_kwargs.get(

@@ -109,6 +109,70 @@ def save_checkpoint(
     return checkpoint_path
 
 
+def save_inference_bundle(
+    bundle_path: str | Path,
+    *,
+    model: torch.nn.Module,
+    architecture_spec: ArchitectureSpec,
+    vocab: dict[str, Any],
+    global_step: int,
+    epoch: int | None = None,
+    adherence_config: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    bundle_path = Path(bundle_path)
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "artifact_type": "inference_bundle",
+        "format_version": 1,
+        "metadata": {
+            "global_step": int(global_step),
+            "epoch": None if epoch is None else int(epoch),
+            **(metadata or {}),
+        },
+        "architecture_spec": architecture_spec.to_dict(),
+        "vocab": vocab,
+        "adherence_config": adherence_config or {},
+        "model_state_dict": model.state_dict(),
+    }
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{bundle_path.name}.",
+        suffix=".tmp",
+        dir=str(bundle_path.parent),
+    )
+    os.close(fd)
+    tmp_bundle_path = Path(tmp_path)
+    try:
+        torch.save(payload, tmp_bundle_path)
+        os.replace(tmp_bundle_path, bundle_path)
+    finally:
+        if tmp_bundle_path.exists():
+            tmp_bundle_path.unlink()
+    return bundle_path
+
+
+def load_inference_artifacts(checkpoint_path: str | Path, map_location: str | torch.device | None = None) -> dict[str, Any]:
+    payload = load_checkpoint(checkpoint_path, map_location=map_location)
+
+    if "model_state_dict" not in payload:
+        raise ValueError(f"Checkpoint at '{checkpoint_path}' does not contain model weights.")
+    if "architecture_spec" not in payload:
+        raise ValueError(f"Checkpoint at '{checkpoint_path}' does not contain architecture_spec.")
+    if "vocab" not in payload:
+        raise ValueError(f"Checkpoint at '{checkpoint_path}' does not contain vocab.")
+
+    return {
+        "artifact_type": str(payload.get("artifact_type", "training_checkpoint")),
+        "metadata": dict(payload.get("metadata", {})),
+        "architecture_spec": dict(payload["architecture_spec"]),
+        "vocab": dict(payload["vocab"]),
+        "adherence_config": dict(payload.get("adherence_config", {})),
+        "model_state_dict": payload["model_state_dict"],
+    }
+
+
 def load_checkpoint(checkpoint_path: str | Path, map_location: str | torch.device | None = None) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_path)
     return torch.load(checkpoint_path, map_location=map_location, weights_only=False)

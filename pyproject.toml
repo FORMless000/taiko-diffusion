@@ -25,3 +25,8 @@ include = ["src*"]
 wandb = [
   "wandb>=0.17.0",
 ]
+webapp = [
+  "fastapi>=0.110.0",
+  "python-multipart>=0.0.9",
+  "uvicorn>=0.29.0",
+]

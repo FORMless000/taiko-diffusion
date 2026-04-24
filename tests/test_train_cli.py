@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if torch is not None:
     from src.model.checkpoints import load_checkpoint
-    from src.model.train_cli import main as train_main
+    from src.model.specs import ArchitectureSpec, TrainingSpec
+    from src.model.train_cli import _build_architecture_spec, _build_training_spec, build_arg_parser, main as train_main
 
 
 class _FakeWandbRun:
@@ -84,6 +85,112 @@ def _write_dummy_dataset(data_root: Path, num_charts: int = 10) -> None:
 
 @unittest.skipIf(torch is None, "torch is not installed in this environment")
 class TestTrainCli(unittest.TestCase):
+    def test_build_architecture_spec_fresh_uses_fast_context_defaults(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--data-root", "unused", "--architecture-name", "taiko_context_transformer"])
+        spec = _build_architecture_spec(args, checkpoint_payload=None)
+        self.assertEqual(spec.history_max_tokens, 256)
+        self.assertEqual(spec.retrieval_top_k, 1)
+        self.assertEqual(spec.retrieval_max_tokens_per_window, 24)
+        self.assertEqual(spec.retrieval_exclude_last_n_windows, 2)
+        self.assertTrue(spec.use_motif_retrieval)
+
+    def test_build_architecture_spec_resume_keeps_context_budget_without_override(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--data-root", "unused"])
+        payload = {
+            "architecture_spec": ArchitectureSpec(
+                name="taiko_context_transformer",
+                history_max_tokens=1024,
+                retrieval_top_k=2,
+                retrieval_max_tokens_per_window=64,
+                retrieval_exclude_last_n_windows=3,
+                use_motif_retrieval=True,
+                max_cached_charts=5,
+            ).to_dict()
+        }
+        spec = _build_architecture_spec(args, checkpoint_payload=payload)
+        self.assertEqual(spec.history_max_tokens, 1024)
+        self.assertEqual(spec.retrieval_top_k, 2)
+        self.assertEqual(spec.retrieval_max_tokens_per_window, 64)
+        self.assertEqual(spec.retrieval_exclude_last_n_windows, 3)
+        self.assertTrue(spec.use_motif_retrieval)
+        self.assertEqual(spec.max_cached_charts, 5)
+
+    def test_build_architecture_spec_resume_applies_explicit_context_overrides(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--data-root",
+                "unused",
+                "--history-max-tokens",
+                "320",
+                "--retrieval-top-k",
+                "1",
+                "--retrieval-max-tokens-per-window",
+                "20",
+                "--retrieval-exclude-last-n-windows",
+                "1",
+                "--no-use-motif-retrieval",
+                "--max-cached-charts",
+                "7",
+            ]
+        )
+        payload = {
+            "architecture_spec": ArchitectureSpec(
+                name="taiko_context_transformer",
+                history_max_tokens=1024,
+                retrieval_top_k=2,
+                retrieval_max_tokens_per_window=64,
+                retrieval_exclude_last_n_windows=3,
+                use_motif_retrieval=True,
+                max_cached_charts=5,
+            ).to_dict()
+        }
+        spec = _build_architecture_spec(args, checkpoint_payload=payload)
+        self.assertEqual(spec.history_max_tokens, 320)
+        self.assertEqual(spec.retrieval_top_k, 1)
+        self.assertEqual(spec.retrieval_max_tokens_per_window, 20)
+        self.assertEqual(spec.retrieval_exclude_last_n_windows, 1)
+        self.assertFalse(spec.use_motif_retrieval)
+        self.assertEqual(spec.max_cached_charts, 7)
+
+    def test_build_training_spec_sets_auto_precision_for_fresh_run(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--data-root", "unused"])
+        spec = _build_training_spec(args, checkpoint_payload=None)
+        self.assertEqual(spec.precision, "auto")
+
+    def test_build_training_spec_resume_keeps_precision_without_override(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--data-root", "unused"])
+        payload = {
+            "training_spec": TrainingSpec(
+                epochs=3,
+                batch_size=2,
+                lr=1e-3,
+                device="cpu",
+                precision="fp16",
+            ).to_dict()
+        }
+        spec = _build_training_spec(args, checkpoint_payload=payload)
+        self.assertEqual(spec.precision, "fp16")
+
+    def test_build_training_spec_resume_applies_precision_override(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--data-root", "unused", "--precision", "bf16"])
+        payload = {
+            "training_spec": TrainingSpec(
+                epochs=3,
+                batch_size=2,
+                lr=1e-3,
+                device="cpu",
+                precision="fp16",
+            ).to_dict()
+        }
+        spec = _build_training_spec(args, checkpoint_payload=payload)
+        self.assertEqual(spec.precision, "bf16")
+
     def test_cli_passes_preprocessing_flags_when_raw_osz_is_provided(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_root = Path(tmpdir) / "dataset"

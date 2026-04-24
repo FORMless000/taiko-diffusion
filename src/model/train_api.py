@@ -17,7 +17,13 @@ from torch.utils.data import DataLoader
 
 from src.preprocessing.prepare_training_data import prepare_training_data
 
-from .checkpoints import CheckpointMetadata, load_checkpoint, restore_rng_states, save_checkpoint
+from .checkpoints import (
+    CheckpointMetadata,
+    load_checkpoint,
+    restore_rng_states,
+    save_checkpoint,
+    save_inference_bundle,
+)
 from .data import (
     build_chart_manifest,
     build_dataset_for_spec,
@@ -26,6 +32,12 @@ from .data import (
     split_chart_manifest,
 )
 from .factory import build_model
+from .runtime import (
+    build_dataloader_runtime_kwargs,
+    build_grad_scaler,
+    normalize_precision,
+    resolve_precision_runtime,
+)
 from .specs import ArchitectureSpec, TrainingSpec
 from .trainer import train_one_epoch, validate_one_epoch
 from .wandb_utils import WandbConfig, setup_wandb_runtime
@@ -130,6 +142,43 @@ def _build_history_template() -> dict[str, list[float]]:
         "train_difficulty_proxy_drift": [],
         "val_difficulty_proxy_drift": [],
     }
+
+
+def _apply_context_budget_overrides(
+    architecture_spec: ArchitectureSpec,
+    *,
+    history_max_tokens: int | None = None,
+    retrieval_top_k: int | None = None,
+    retrieval_max_tokens_per_window: int | None = None,
+    retrieval_exclude_last_n_windows: int | None = None,
+    use_motif_retrieval: bool | None = None,
+    max_cached_charts: int | None = None,
+) -> None:
+    context_fields_changed = False
+
+    if history_max_tokens is not None:
+        architecture_spec.history_max_tokens = max(1, int(history_max_tokens))
+        context_fields_changed = True
+    if retrieval_top_k is not None:
+        architecture_spec.retrieval_top_k = max(0, int(retrieval_top_k))
+        context_fields_changed = True
+    if retrieval_max_tokens_per_window is not None:
+        architecture_spec.retrieval_max_tokens_per_window = max(1, int(retrieval_max_tokens_per_window))
+        context_fields_changed = True
+    if retrieval_exclude_last_n_windows is not None:
+        architecture_spec.retrieval_exclude_last_n_windows = max(0, int(retrieval_exclude_last_n_windows))
+        context_fields_changed = True
+    if use_motif_retrieval is not None:
+        architecture_spec.use_motif_retrieval = bool(use_motif_retrieval)
+        context_fields_changed = True
+    if max_cached_charts is not None:
+        architecture_spec.max_cached_charts = max(1, int(max_cached_charts))
+
+    if context_fields_changed and str(getattr(architecture_spec, "name", "")).strip() == "taiko_context_transformer":
+        architecture_spec.max_len = max(
+            int(getattr(architecture_spec, "max_len", 1)),
+            int(architecture_spec.required_context_max_len()),
+        )
 
 
 def _append_history(history: dict[str, list[float]], train_stats: dict[str, Any], val_stats: dict[str, Any], lr: float) -> None:
@@ -452,27 +501,31 @@ def create_dataset_bundle(
         architecture_spec,
     )
     _stage_log(log_startup, "dataset objects", stage)
+    dataloader_kwargs = build_dataloader_runtime_kwargs(
+        training_spec,
+        torch.device(training_spec.device),
+    )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=training_spec.batch_size,
         shuffle=True,
-        num_workers=training_spec.num_workers,
         collate_fn=collate_fn,
+        **dataloader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=training_spec.batch_size,
         shuffle=False,
-        num_workers=training_spec.num_workers,
         collate_fn=collate_fn,
+        **dataloader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=training_spec.batch_size,
         shuffle=False,
-        num_workers=training_spec.num_workers,
         collate_fn=collate_fn,
+        **dataloader_kwargs,
     )
 
     adherence_config = {
@@ -507,10 +560,36 @@ def create_training_context(
     index_cache_dir: str | Path | None = None,
     log_startup: bool = True,
     max_cached_charts: int | None = None,
+    history_max_tokens: int | None = None,
+    retrieval_top_k: int | None = None,
+    retrieval_max_tokens_per_window: int | None = None,
+    retrieval_exclude_last_n_windows: int | None = None,
+    use_motif_retrieval: bool | None = None,
+    precision: str | None = None,
+    pin_memory: bool | None = None,
+    persistent_workers: bool | None = None,
+    prefetch_factor: int | None = None,
 ) -> TrainingContext:
     artifacts = build_training_artifacts(data_root, checkpoints_dir=checkpoints_dir)
     architecture_spec = architecture_spec or ArchitectureSpec()
+    _apply_context_budget_overrides(
+        architecture_spec,
+        history_max_tokens=history_max_tokens,
+        retrieval_top_k=retrieval_top_k,
+        retrieval_max_tokens_per_window=retrieval_max_tokens_per_window,
+        retrieval_exclude_last_n_windows=retrieval_exclude_last_n_windows,
+        use_motif_retrieval=use_motif_retrieval,
+        max_cached_charts=max_cached_charts,
+    )
     training_spec = training_spec or TrainingSpec(device=_default_device())
+    if precision is not None:
+        training_spec.precision = normalize_precision(precision)
+    if pin_memory is not None:
+        training_spec.pin_memory = bool(pin_memory)
+    if persistent_workers is not None:
+        training_spec.persistent_workers = bool(persistent_workers)
+    if prefetch_factor is not None:
+        training_spec.prefetch_factor = max(1, int(prefetch_factor))
 
     _set_global_seed(training_spec.seed)
     dataset = create_dataset_bundle(
@@ -563,6 +642,15 @@ def load_training_context_from_checkpoint(
     index_cache_dir: str | Path | None = None,
     log_startup: bool = True,
     max_cached_charts: int | None = None,
+    history_max_tokens: int | None = None,
+    retrieval_top_k: int | None = None,
+    retrieval_max_tokens_per_window: int | None = None,
+    retrieval_exclude_last_n_windows: int | None = None,
+    use_motif_retrieval: bool | None = None,
+    precision: str | None = None,
+    pin_memory: bool | None = None,
+    persistent_workers: bool | None = None,
+    prefetch_factor: int | None = None,
 ) -> TrainingContext:
     checkpoint_path = Path(checkpoint_path).resolve()
     payload = load_checkpoint(checkpoint_path, map_location="cpu")
@@ -570,6 +658,15 @@ def load_training_context_from_checkpoint(
 
     resolved_data_root = Path(data_root).resolve() if data_root is not None else Path(metadata.data_root).resolve()
     architecture_spec = ArchitectureSpec.from_dict(payload["architecture_spec"])
+    _apply_context_budget_overrides(
+        architecture_spec,
+        history_max_tokens=history_max_tokens,
+        retrieval_top_k=retrieval_top_k,
+        retrieval_max_tokens_per_window=retrieval_max_tokens_per_window,
+        retrieval_exclude_last_n_windows=retrieval_exclude_last_n_windows,
+        use_motif_retrieval=use_motif_retrieval,
+        max_cached_charts=max_cached_charts,
+    )
     training_spec = TrainingSpec.from_dict(payload["training_spec"])
 
     if device is not None:
@@ -578,6 +675,14 @@ def load_training_context_from_checkpoint(
         training_spec.batch_size = batch_size
     if num_workers is not None:
         training_spec.num_workers = num_workers
+    if precision is not None:
+        training_spec.precision = normalize_precision(precision)
+    if pin_memory is not None:
+        training_spec.pin_memory = bool(pin_memory)
+    if persistent_workers is not None:
+        training_spec.persistent_workers = bool(persistent_workers)
+    if prefetch_factor is not None:
+        training_spec.prefetch_factor = max(1, int(prefetch_factor))
 
     resolved_checkpoints_dir = None
     if checkpoints_dir is not None:
@@ -596,6 +701,15 @@ def load_training_context_from_checkpoint(
         index_cache_dir=index_cache_dir,
         log_startup=log_startup,
         max_cached_charts=max_cached_charts,
+        history_max_tokens=history_max_tokens,
+        retrieval_top_k=retrieval_top_k,
+        retrieval_max_tokens_per_window=retrieval_max_tokens_per_window,
+        retrieval_exclude_last_n_windows=retrieval_exclude_last_n_windows,
+        use_motif_retrieval=use_motif_retrieval,
+        precision=precision,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     context.model.load_state_dict(payload["model_state_dict"])
@@ -622,6 +736,8 @@ def train_context(
     metrics_logger: Callable[[dict[str, Any]], None] | None = None,
     log_every_n_batches: int | None = None,
     wandb_config: WandbConfig | None = None,
+    save_inference_every_n_steps: int | None = None,
+    inference_snapshots_dir: str | Path | None = None,
 ) -> TrainingContext:
     wandb_runtime = None
     if metrics_logger is None and wandb_config is not None:
@@ -633,6 +749,63 @@ def train_context(
 
     target_epochs = context.training_spec.epochs if epochs is None else int(epochs)
     context.training_spec.epochs = target_epochs
+    device = torch.device(context.training_spec.device)
+    snapshot_interval = None if save_inference_every_n_steps is None else max(1, int(save_inference_every_n_steps))
+    resolved_snapshots_dir = (
+        Path(inference_snapshots_dir).resolve()
+        if inference_snapshots_dir is not None
+        else (context.artifacts.checkpoints_dir / "inference_snapshots")
+    )
+    precision_runtime = resolve_precision_runtime(
+        getattr(context.training_spec, "precision", "auto"),
+        device,
+    )
+    grad_scaler = build_grad_scaler(precision_runtime)
+
+    if precision_runtime.fallback_reason:
+        print(f"[runtime] precision fallback: {precision_runtime.fallback_reason}")
+    print(
+        "[runtime] precision "
+        f"requested={precision_runtime.requested} resolved={precision_runtime.resolved} "
+        f"autocast={int(precision_runtime.autocast_enabled)} scaler={int(precision_runtime.scaler_enabled)}"
+    )
+    if str(getattr(context.architecture_spec, "name", "")).strip() == "taiko_context_transformer":
+        print(
+            "[runtime] context_budget "
+            f"history_max_tokens={int(getattr(context.architecture_spec, 'history_max_tokens', 256))} "
+            f"retrieval_top_k={int(getattr(context.architecture_spec, 'retrieval_top_k', 1))} "
+            f"retrieval_max_tokens_per_window={int(getattr(context.architecture_spec, 'retrieval_max_tokens_per_window', 24))} "
+            f"retrieval_exclude_last_n_windows={int(getattr(context.architecture_spec, 'retrieval_exclude_last_n_windows', 2))} "
+            f"use_motif_retrieval={int(bool(getattr(context.architecture_spec, 'use_motif_retrieval', True)))}"
+        )
+    if snapshot_interval is not None:
+        print(
+            "[runtime] inference_snapshots "
+            f"every_n_steps={snapshot_interval} "
+            f"dir={resolved_snapshots_dir}"
+        )
+
+    def _maybe_save_inference_snapshot(batch_state: dict[str, Any]) -> None:
+        if snapshot_interval is None:
+            return
+        global_step = int(batch_state["global_step"])
+        if global_step <= 0 or global_step % snapshot_interval != 0:
+            return
+        snapshot_path = resolved_snapshots_dir / f"step_{global_step:06d}.pt"
+        save_inference_bundle(
+            snapshot_path,
+            model=context.model,
+            architecture_spec=context.architecture_spec,
+            vocab=context.dataset.vocab,
+            global_step=global_step,
+            epoch=batch_state.get("epoch"),
+            adherence_config=context.dataset.adherence_config,
+            metadata={
+                "source": "train_context",
+                "checkpoints_dir": str(context.artifacts.checkpoints_dir.resolve()),
+                "step_loss": float(batch_state.get("loss", 0.0)),
+            },
+        )
 
     try:
         for epoch in range(context.start_epoch, target_epochs + 1):
@@ -641,23 +814,29 @@ def train_context(
                 dataloader=context.dataset.train_loader,
                 optimizer=context.optimizer,
                 criterion=context.criterion,
-                device=torch.device(context.training_spec.device),
+                device=device,
                 adherence_config=context.dataset.adherence_config,
                 metrics_logger=metrics_logger,
                 log_every_n_batches=log_every_n_batches,
                 epoch=epoch,
                 global_step_start=context.global_step,
+                autocast_device_type=(device.type if precision_runtime.autocast_enabled else None),
+                autocast_dtype=precision_runtime.autocast_dtype,
+                grad_scaler=grad_scaler,
+                batch_callback=_maybe_save_inference_snapshot,
             )
             val_stats = validate_one_epoch(
                 model=context.model,
                 dataloader=context.dataset.val_loader,
                 criterion=context.criterion,
-                device=torch.device(context.training_spec.device),
+                device=device,
                 adherence_config=context.dataset.adherence_config,
                 metrics_logger=metrics_logger,
                 log_every_n_batches=log_every_n_batches,
                 epoch=epoch,
                 global_step_start=context.global_step + len(context.dataset.train_loader),
+                autocast_device_type=(device.type if precision_runtime.autocast_enabled else None),
+                autocast_dtype=precision_runtime.autocast_dtype,
             )
 
             current_lr = context.optimizer.param_groups[0]["lr"]
@@ -666,7 +845,9 @@ def train_context(
 
             print(
                 f"Epoch {epoch}/{target_epochs} | lr: {current_lr:.6f} | "
-                f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f}"
+                f"train loss: {train_stats['loss']:.4f} | val loss: {val_stats['loss']:.4f} | "
+                f"train samp/s: {float(train_stats.get('samples_per_sec', 0.0)):.2f} | "
+                f"train tok/s: {float(train_stats.get('tokens_per_sec', 0.0)):.2f}"
             )
 
             current_best = val_stats["loss"] if context.best_val_loss is None else min(context.best_val_loss, val_stats["loss"])
@@ -731,6 +912,12 @@ def train_context(
                     "global_step": int(context.global_step),
                     "train/loss_epoch": float(train_stats["loss"]),
                     "val/loss_epoch": float(val_stats["loss"]),
+                    "train/avg_batch_time_sec": float(train_stats.get("avg_batch_time_sec", 0.0)),
+                    "train/samples_per_sec": float(train_stats.get("samples_per_sec", 0.0)),
+                    "train/tokens_per_sec": float(train_stats.get("tokens_per_sec", 0.0)),
+                    "val/avg_batch_time_sec": float(val_stats.get("avg_batch_time_sec", 0.0)),
+                    "val/samples_per_sec": float(val_stats.get("samples_per_sec", 0.0)),
+                    "val/tokens_per_sec": float(val_stats.get("tokens_per_sec", 0.0)),
                     "optimizer/lr": float(current_lr),
                     "checkpoint/last_path": str((context.artifacts.checkpoints_dir / "last.ckpt").resolve()),
                     "checkpoint/best_updated": int(best_updated),

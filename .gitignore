@@ -10,13 +10,26 @@ __pycache__/
 venv/
 env/
 
+# Local tool caches
+.wandb/
+.vscode/
+
 # Local data outputs
+sample_data/inf*/
 sample_data/unpacked/
 sample_data/beat*/
 sample_data/chart*/
 sample_data/train*/
 sample_data_large/
+sample_data_large_maxopt/
 checkpoints/
+sample_data_large/
+sample_data_large_maxopt/
+webapp/runtime/*
+!webapp/runtime/.gitkeep
+webapp/frontend/.next/
+webapp/frontend/out/
+webapp/frontend/node_modules/
 
 # Reference code
 src/difficulty/osu_taiko_reimpl_bundle/
