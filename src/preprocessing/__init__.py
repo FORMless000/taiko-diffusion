@@ -1,9 +1,15 @@
 """Preprocessing utilities for osu!taiko data."""
 
-from .build_snapshot_dataset import build_snapshot_dataset
 from .unpack_osz import unpack_osz_files
 
-__all__ = ["build_snapshot_dataset", "unpack_osz_files"]
+__all__ = ["unpack_osz_files"]
+
+try:
+    from .build_snapshot_dataset import build_snapshot_dataset
+except ImportError:
+    build_snapshot_dataset = None
+else:
+    __all__.append("build_snapshot_dataset")
 
 try:
     from .prepare_training_data import (

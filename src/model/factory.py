@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 import torch.nn as nn
 
+from .diffusion_refiner import TaikoDiffusionRefiner
 from .model import TaikoTransformer
 from .specs import ArchitectureSpec
 from .taiko_context import TaikoContextTransformer
@@ -40,5 +41,10 @@ def _build_taiko_context_transformer(spec: ArchitectureSpec, vocab_size: int) ->
     )
 
 
+def _build_taiko_diffusion_refiner(spec: ArchitectureSpec, vocab_size: int) -> nn.Module:
+    return TaikoDiffusionRefiner(vocab_size=vocab_size, **spec.model_kwargs())
+
+
 register_model_builder("taiko_transformer", _build_taiko_transformer)
 register_model_builder("taiko_context_transformer", _build_taiko_context_transformer)
+register_model_builder("taiko_diffusion_refiner", _build_taiko_diffusion_refiner)

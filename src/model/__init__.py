@@ -55,6 +55,9 @@ from .model import (
     OutputHead,
     TaikoTransformer,
 )
+from .diffusion_refiner import (
+    TaikoDiffusionRefiner,
+)
 from .taiko_context import (
     TaikoContextTransformer,
 )
@@ -134,6 +137,7 @@ __all__ = [
     "generate_causal_mask",
     "OutputHead",
     "TaikoTransformer",
+    "TaikoDiffusionRefiner",
     "TaikoContextTransformer",
     "train_one_epoch",
     "validate_one_epoch",

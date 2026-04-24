@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from src.inference.infer_from_metadata import (
     MetadataInferenceInput,
+    _default_device,
     _build_osu_filename_from_version,
     _infer_beatmap_id_value,
     _infer_difficulty_value,
@@ -17,6 +18,7 @@ from src.inference.infer_from_metadata import (
     estimate_density_nps,
     extract_primary_timing,
     load_generator_from_checkpoint,
+    load_inference_model_from_checkpoint,
     mark_generated_metadata,
     notes_baseline_from_reference,
     song_output_to_notes_json,
@@ -27,6 +29,14 @@ from src.preprocessing.osutaiko_reconstructor import reconstruct_osu
 
 DEFAULT_SLIDER_MULTIPLIER = 1.4
 DEFAULT_SLIDER_TICK_RATE = 1.0
+FRAMES_PER_BEAT = 48
+BASELINE_WINDOW_BEATS = 4
+REFINER_BLOCK_BEATS = 32
+FRAMES_PER_WINDOW = FRAMES_PER_BEAT * BASELINE_WINDOW_BEATS
+FRAMES_PER_REFINER_BLOCK = FRAMES_PER_BEAT * REFINER_BLOCK_BEATS
+WINDOWS_PER_REFINER_BLOCK = REFINER_BLOCK_BEATS // BASELINE_WINDOW_BEATS
+MODEL_INFERENCE_KINDS = {"autoregressive", "hybrid_refine"}
+SPECIAL_REFINER_TOKENS = {"PAD", "BOS", "EOS", "MASK"}
 DEFAULT_OUTPUT_ARTIFACT_KINDS = [
     "notes_json",
     "timing_json",
@@ -58,6 +68,8 @@ class ModelDescriptor:
     checkpoint_path: Path
     architecture_name: str
     default_sampling: dict[str, Any]
+    inference_kind: str = "autoregressive"
+    bootstrap_model_id: str | None = None
     input_fields: list[dict[str, Any]] = field(default_factory=list)
     output_artifact_kinds: list[str] = field(default_factory=list)
     enabled: bool = True
@@ -68,6 +80,8 @@ class ModelDescriptor:
             "label": self.label,
             "architecture_name": self.architecture_name,
             "default_sampling": dict(self.default_sampling),
+            "inference_kind": self.inference_kind,
+            "bootstrap_model_id": self.bootstrap_model_id,
             "input_fields": [dict(field_payload) for field_payload in self.input_fields],
             "output_artifact_kinds": list(self.output_artifact_kinds),
             "enabled": bool(self.enabled),
@@ -152,6 +166,7 @@ def _default_sampling_payload() -> dict[str, Any]:
         "ts_top_k": 16,
         "min_event_candidates": 2,
         "repetition_penalty": 1.0,
+        "mask_ratio": 0.25,
         "audio_cache_size": 8,
         "device": None,
     }
@@ -163,6 +178,31 @@ def _shared_input_fields() -> list[dict[str, Any]]:
 
 def _shared_output_artifact_kinds() -> list[str]:
     return list(DEFAULT_OUTPUT_ARTIFACT_KINDS)
+
+
+def _finalize_model_registry(registry: dict[str, ModelDescriptor]) -> dict[str, ModelDescriptor]:
+    finalized: dict[str, ModelDescriptor] = {}
+    for model_id, model in registry.items():
+        enabled = bool(model.checkpoint_path.exists())
+        if model.inference_kind == "hybrid_refine":
+            bootstrap_model_id = str(model.bootstrap_model_id or "").strip()
+            if not bootstrap_model_id:
+                raise ValueError(f"Hybrid model '{model_id}' is missing bootstrap_model_id.")
+            if bootstrap_model_id == model_id:
+                raise ValueError(f"Hybrid model '{model_id}' cannot use itself as bootstrap_model_id.")
+            bootstrap_model = registry.get(bootstrap_model_id)
+            if bootstrap_model is None:
+                raise ValueError(
+                    f"Hybrid model '{model_id}' references unknown bootstrap_model_id '{bootstrap_model_id}'."
+                )
+            if bootstrap_model.inference_kind != "autoregressive":
+                raise ValueError(
+                    f"Hybrid model '{model_id}' must reference an autoregressive bootstrap model, "
+                    f"got '{bootstrap_model.inference_kind}' for '{bootstrap_model_id}'."
+                )
+            enabled = enabled and bool(bootstrap_model.checkpoint_path.exists())
+        finalized[model_id] = replace(model, enabled=enabled)
+    return finalized
 
 
 def _coerce_model_descriptor(
@@ -181,6 +221,15 @@ def _coerce_model_descriptor(
         raise ValueError(f"Model '{model_id}' is missing architecture_name.")
     if not checkpoint_raw:
         raise ValueError(f"Model '{model_id}' is missing checkpoint_path.")
+    inference_kind = str(payload.get("inference_kind") or "autoregressive").strip().lower()
+    if inference_kind not in MODEL_INFERENCE_KINDS:
+        raise ValueError(
+            f"Model '{model_id}' has unsupported inference_kind '{inference_kind}'. "
+            f"Allowed: {sorted(MODEL_INFERENCE_KINDS)}"
+        )
+    bootstrap_model_id = payload.get("bootstrap_model_id")
+    if inference_kind == "hybrid_refine" and not str(bootstrap_model_id or "").strip():
+        raise ValueError(f"Hybrid model '{model_id}' must define bootstrap_model_id.")
 
     checkpoint_path = Path(checkpoint_raw)
     if not checkpoint_path.is_absolute():
@@ -200,6 +249,8 @@ def _coerce_model_descriptor(
         checkpoint_path=checkpoint_path,
         architecture_name=architecture_name,
         default_sampling=default_sampling,
+        inference_kind=inference_kind,
+        bootstrap_model_id=None if bootstrap_model_id is None else str(bootstrap_model_id).strip(),
         input_fields=[dict(field_payload) for field_payload in (input_fields or _shared_input_fields())],
         output_artifact_kinds=list(output_artifact_kinds or _shared_output_artifact_kinds()),
         enabled=enabled,
@@ -228,7 +279,8 @@ def built_in_model_registry(repo_root: str | Path | None = None) -> dict[str, Mo
             "architecture_name": "taiko_transformer",
         },
     ]
-    return {payload["id"]: _coerce_model_descriptor(payload, repo_root=root) for payload in models}
+    registry = {payload["id"]: _coerce_model_descriptor(payload, repo_root=root) for payload in models}
+    return _finalize_model_registry(registry)
 
 
 def load_model_registry(path: str | Path, repo_root: str | Path | None = None) -> dict[str, ModelDescriptor]:
@@ -262,7 +314,7 @@ def load_model_registry(path: str | Path, repo_root: str | Path | None = None) -
         if model.id in registry:
             raise ValueError(f"Duplicate model id '{model.id}' in manifest '{manifest_path}'.")
         registry[model.id] = model
-    return registry
+    return _finalize_model_registry(registry)
 
 
 def default_model_registry(repo_root: str | Path | None = None) -> dict[str, ModelDescriptor]:
@@ -397,6 +449,243 @@ def _build_sampling_config(model: ModelDescriptor, overrides: dict[str, Any] | N
     )
 
 
+def _resolve_inference_device(device: Any):
+    if device is None or str(device).strip() == "":
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - exercised through runtime checks
+            raise RuntimeError("PyTorch is required for checkpoint-based generation.") from exc
+        return torch.device(_default_device())
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - exercised through runtime checks
+        raise RuntimeError("PyTorch is required for checkpoint-based generation.") from exc
+    return torch.device(device)
+
+
+def _build_refiner_sampling_payload(model: ModelDescriptor, overrides: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(model.default_sampling)
+    payload.update(dict(overrides or {}))
+    payload["mask_ratio"] = float(max(0.0, min(1.0, payload.get("mask_ratio", 0.25))))
+    payload["temperature"] = float(payload.get("temperature", 1.1))
+    return payload
+
+
+def _song_events_from_tokens(tokens: list[str], *, start_frame: int) -> list[tuple[int, str]]:
+    cursor_frame = 0
+    events: list[tuple[int, str]] = []
+    for token in list(tokens):
+        token_text = str(token).strip().upper()
+        if not token_text:
+            continue
+        if token_text.startswith("TS_"):
+            try:
+                cursor_frame = max(0, cursor_frame + int(token_text[3:]))
+            except ValueError:
+                continue
+            continue
+        events.append((int(start_frame) + cursor_frame, token_text))
+    return events
+
+
+def _tokens_from_song_events(events: list[tuple[int, str]], *, start_frame: int) -> list[str]:
+    if not events:
+        return []
+
+    ordered = sorted((int(frame), str(token).strip().upper()) for frame, token in events)
+    tokens: list[str] = []
+    prev_local_frame = 0
+    for frame, token in ordered:
+        local_frame = max(0, int(frame) - int(start_frame))
+        delta = local_frame - prev_local_frame
+        if delta > 0:
+            tokens.append(f"TS_{delta}")
+        tokens.append(token)
+        prev_local_frame = local_frame
+    return tokens
+
+
+def convert_song_output_to_refiner_blocks(
+    song_output: list[dict[str, Any]],
+    *,
+    windows_per_block: int = WINDOWS_PER_REFINER_BLOCK,
+) -> list[dict[str, Any]]:
+    ordered = sorted(song_output, key=lambda item: int(item.get("seq_idx", 0)))
+    if windows_per_block <= 0:
+        raise ValueError("windows_per_block must be positive.")
+
+    blocks: list[dict[str, Any]] = []
+    full_block_count = len(ordered) // windows_per_block
+    for block_idx in range(full_block_count):
+        chunk = ordered[block_idx * windows_per_block:(block_idx + 1) * windows_per_block]
+        start_frame = int(chunk[0]["start_frame"])
+        end_frame = start_frame + windows_per_block * FRAMES_PER_WINDOW - 1
+        events: list[tuple[int, str]] = []
+        for item in chunk:
+            events.extend(_song_events_from_tokens(list(item.get("pred_tokens", [])), start_frame=int(item["start_frame"])))
+        blocks.append(
+            {
+                "block_idx": block_idx,
+                "seq_start_idx": int(chunk[0]["seq_idx"]),
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "pred_tokens": _tokens_from_song_events(events, start_frame=start_frame),
+            }
+        )
+    return blocks
+
+
+def apply_refined_blocks_to_song_output(
+    song_output: list[dict[str, Any]],
+    refined_blocks: list[dict[str, Any]],
+    *,
+    windows_per_block: int = WINDOWS_PER_REFINER_BLOCK,
+) -> list[dict[str, Any]]:
+    updated_items = [dict(item) for item in sorted(song_output, key=lambda item: int(item.get("seq_idx", 0)))]
+    by_seq_idx = {int(item["seq_idx"]): item for item in updated_items}
+
+    for block in refined_blocks:
+        block_events = _song_events_from_tokens(list(block.get("pred_tokens", [])), start_frame=int(block["start_frame"]))
+        seq_start_idx = int(block.get("seq_start_idx", int(block["start_frame"]) // FRAMES_PER_WINDOW))
+        for offset in range(windows_per_block):
+            seq_idx = seq_start_idx + offset
+            target = by_seq_idx.get(seq_idx)
+            if target is None:
+                break
+            seq_start_frame = int(target["start_frame"])
+            seq_end_frame = int(target["end_frame"])
+            seq_events = [
+                (frame, token)
+                for frame, token in block_events
+                if seq_start_frame <= int(frame) <= seq_end_frame
+            ]
+            target["pred_tokens"] = _tokens_from_song_events(seq_events, start_frame=seq_start_frame)
+    return [by_seq_idx[int(item["seq_idx"])] for item in sorted(updated_items, key=lambda item: int(item["seq_idx"]))]
+
+
+def mask_note_tokens_for_refinement(
+    input_ids: list[int],
+    token_to_id: dict[str, int],
+    *,
+    mask_ratio: float,
+    generator=None,
+) -> tuple[list[int], list[int]]:
+    import random
+
+    if "MASK" not in token_to_id:
+        raise ValueError("Refiner vocabulary must include MASK.")
+
+    mask_id = int(token_to_id["MASK"])
+    special_ids = {
+        int(token_to_id[token])
+        for token in SPECIAL_REFINER_TOKENS
+        if token in token_to_id
+    }
+    ts_ids = {
+        int(token_id)
+        for token, token_id in token_to_id.items()
+        if str(token).startswith("TS_")
+    }
+
+    note_positions = [
+        idx
+        for idx, token_id in enumerate(list(input_ids))
+        if int(token_id) not in special_ids and int(token_id) not in ts_ids
+    ]
+    if not note_positions or mask_ratio <= 0.0:
+        return list(input_ids), []
+
+    if mask_ratio >= 1.0:
+        chosen_positions = list(note_positions)
+    else:
+        num_to_mask = max(1, int(round(len(note_positions) * float(mask_ratio))))
+        if generator is not None:
+            try:
+                import torch
+            except ImportError:
+                generator = None
+            else:
+                perm = torch.randperm(len(note_positions), generator=generator)
+                chosen_positions = [note_positions[int(idx)] for idx in perm[:num_to_mask].tolist()]
+        if generator is None:
+            rng = random.Random(42)
+            chosen_positions = rng.sample(note_positions, k=min(num_to_mask, len(note_positions)))
+
+    masked_ids = list(int(token_id) for token_id in input_ids)
+    for pos in chosen_positions:
+        masked_ids[int(pos)] = mask_id
+    return masked_ids, sorted(int(pos) for pos in chosen_positions)
+
+
+def _sample_token_from_subset(logits_1d, candidate_ids, *, temperature: float) -> int:
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - exercised through runtime checks
+        raise RuntimeError("PyTorch is required for checkpoint-based generation.") from exc
+
+    if not candidate_ids:
+        raise ValueError("candidate_ids must not be empty.")
+
+    candidate_tensor = torch.tensor(candidate_ids, dtype=torch.long, device=logits_1d.device)
+    candidate_logits = logits_1d.index_select(0, candidate_tensor)
+    if temperature <= 0.0:
+        return int(candidate_tensor[int(torch.argmax(candidate_logits).item())].item())
+
+    scaled_logits = candidate_logits / max(1e-6, float(temperature))
+    probs = torch.softmax(scaled_logits, dim=0)
+    sampled_idx = torch.multinomial(probs, num_samples=1)
+    return int(candidate_tensor[int(sampled_idx.item())].item())
+
+
+def _build_aligned_audio_blocks(
+    audio_path: str | Path,
+    *,
+    offset_ms: float,
+    bpm: float,
+    meter: int,
+    frames_per_block: int = FRAMES_PER_REFINER_BLOCK,
+) -> list[Any]:
+    from src.preprocessing.beat_aligned_dataset import (
+        build_beat_aligned_frame_timeline,
+        build_raw_mel_spectrogram,
+        compute_beat_grid_info,
+        get_audio_info,
+        interpolate_raw_mel_to_beat_aligned_timeline,
+    )
+
+    beat_duration_ms = 60000.0 / max(float(bpm), 1e-6)
+    audio_info = get_audio_info(Path(audio_path))
+    beat_grid_info, _ = compute_beat_grid_info(
+        offset_ms=float(offset_ms),
+        beat_duration_ms=float(beat_duration_ms),
+        audio_duration_ms=float(audio_info["audio_duration_ms"]),
+    )
+    total_blocks = int(beat_grid_info.total_frames // frames_per_block)
+    if total_blocks <= 0:
+        return []
+
+    frame_times_ms = build_beat_aligned_frame_timeline(
+        offset_ms=float(offset_ms),
+        beat_duration_ms=float(beat_duration_ms),
+        total_frames=beat_grid_info.total_frames,
+    )
+    mel_spec_db, orig_frame_times_ms = build_raw_mel_spectrogram(
+        waveform=audio_info["waveform"],
+        sample_rate=audio_info["sample_rate"],
+    )
+    aligned_mel_db = interpolate_raw_mel_to_beat_aligned_timeline(
+        mel_spec_db=mel_spec_db,
+        orig_frame_times_ms=orig_frame_times_ms,
+        beat_aligned_frame_times_ms=frame_times_ms,
+    )
+
+    return [
+        aligned_mel_db[block_idx * frames_per_block:(block_idx + 1) * frames_per_block]
+        for block_idx in range(total_blocks)
+    ]
+
+
 class GenerationService:
     def __init__(self, model_registry: dict[str, ModelDescriptor] | None = None):
         self.model_registry = dict(model_registry or default_model_registry())
@@ -413,11 +702,7 @@ class GenerationService:
             raise FileNotFoundError(f"Checkpoint is not available for model '{model_id}': {model.checkpoint_path}")
         return model
 
-    def generate(self, request: GenerationRequest, *, output_root: str | Path) -> GenerationResult:
-        model = self.get_model(request.model_id)
-        output_root = Path(output_root).resolve()
-        output_root.mkdir(parents=True, exist_ok=True)
-
+    def _build_chart_input(self, request: GenerationRequest) -> MetadataInferenceInput:
         chart_stem = request.chart_stem or build_chart_stem(request.metadata)
         metadata_json = build_metadata_json(
             request.metadata,
@@ -458,7 +743,7 @@ class GenerationService:
             else float(estimate_density_nps({"notes": []}, offset_ms=offset_ms))
         )
 
-        chart_input = MetadataInferenceInput(
+        return MetadataInferenceInput(
             chart_stem=chart_stem,
             audio_path=Path(request.audio_path).resolve(),
             metadata_json=metadata_json,
@@ -472,15 +757,19 @@ class GenerationService:
             reference_notes_json=None,
         )
 
+    def _generate_song_output_autoregressive(
+        self,
+        model: ModelDescriptor,
+        *,
+        chart_input: MetadataInferenceInput,
+        sampling_override: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], Any]:
         sampling_payload = dict(model.default_sampling)
-        sampling_payload.update(dict(request.sampling_override or {}))
+        sampling_payload.update(dict(sampling_override or {}))
         max_decode_len = max(1, int(sampling_payload.get("max_decode_len", model.default_sampling.get("max_decode_len", 64))))
         audio_cache_size = max(1, int(sampling_payload.get("audio_cache_size", model.default_sampling.get("audio_cache_size", 8))))
         device = sampling_payload.get("device", model.default_sampling.get("device"))
-        sampling_config = _build_sampling_config(model, request.sampling_override)
-        output_slug = _build_model_output_slug(model)
-        chart_output_dir = output_root / model.id / chart_stem
-        chart_output_dir.mkdir(parents=True, exist_ok=True)
+        sampling_config = _build_sampling_config(model, sampling_override)
 
         generator, architecture_spec = load_generator_from_checkpoint(
             model.checkpoint_path,
@@ -497,6 +786,143 @@ class GenerationService:
             density_nps=chart_input.density_nps,
             beatmap_id=chart_input.beatmap_id,
             sampling_config=sampling_config,
+        )
+        return song_output, architecture_spec
+
+    def _refine_song_output_with_diffusion_model(
+        self,
+        model: ModelDescriptor,
+        *,
+        chart_input: MetadataInferenceInput,
+        song_output: list[dict[str, Any]],
+        sampling_override: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - exercised through runtime checks
+            raise RuntimeError("PyTorch is required for checkpoint-based generation.") from exc
+
+        device_payload = _build_refiner_sampling_payload(model, sampling_override)
+        resolved_device = _resolve_inference_device(device_payload.get("device", model.default_sampling.get("device")))
+        model_instance, architecture_spec, token_to_id, id_to_token = load_inference_model_from_checkpoint(
+            model.checkpoint_path,
+            device=resolved_device,
+        )
+        if str(architecture_spec.name).strip() != "taiko_diffusion_refiner":
+            raise ValueError(
+                f"Hybrid refiner model '{model.id}' expected architecture 'taiko_diffusion_refiner', "
+                f"got '{architecture_spec.name}'."
+            )
+        if "MASK" not in token_to_id:
+            raise ValueError(f"Hybrid refiner model '{model.id}' vocabulary is missing MASK.")
+        if "BOS" not in token_to_id:
+            raise ValueError(f"Hybrid refiner model '{model.id}' vocabulary is missing BOS.")
+
+        note_token_ids = [
+            int(token_id)
+            for token, token_id in token_to_id.items()
+            if str(token) not in SPECIAL_REFINER_TOKENS and not str(token).startswith("TS_")
+        ]
+        if not note_token_ids:
+            raise ValueError(f"Hybrid refiner model '{model.id}' vocabulary does not contain any note tokens.")
+
+        audio_blocks = _build_aligned_audio_blocks(
+            chart_input.audio_path,
+            offset_ms=chart_input.offset_ms,
+            bpm=chart_input.bpm,
+            meter=chart_input.meter,
+        )
+        refiner_blocks = convert_song_output_to_refiner_blocks(song_output)
+        if not audio_blocks or not refiner_blocks:
+            return song_output, architecture_spec
+
+        generator = torch.Generator()
+        generator.manual_seed(42)
+        refined_blocks: list[dict[str, Any]] = []
+        full_block_count = min(len(audio_blocks), len(refiner_blocks))
+
+        with torch.no_grad():
+            for block_idx in range(full_block_count):
+                block = dict(refiner_blocks[block_idx])
+                raw_tokens = list(block.get("pred_tokens", []))
+                input_ids = [int(token_to_id["BOS"])] + [int(token_to_id[token]) for token in raw_tokens]
+                masked_ids, mask_positions = mask_note_tokens_for_refinement(
+                    input_ids,
+                    token_to_id,
+                    mask_ratio=float(device_payload["mask_ratio"]),
+                    generator=generator,
+                )
+                if not mask_positions:
+                    refined_blocks.append(block)
+                    continue
+
+                audio_tensor = torch.tensor(audio_blocks[block_idx], dtype=torch.float32, device=resolved_device).unsqueeze(0)
+                input_tensor = torch.tensor(masked_ids, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                attention_mask = torch.ones_like(input_tensor, device=resolved_device)
+                logits = model_instance(
+                    audio_tensor,
+                    input_tensor,
+                    decoder_attention_mask=attention_mask,
+                )
+
+                refined_input_ids = list(masked_ids)
+                for pos in mask_positions:
+                    refined_input_ids[pos] = _sample_token_from_subset(
+                        logits[0, pos, :],
+                        note_token_ids,
+                        temperature=float(device_payload["temperature"]),
+                    )
+
+                block["pred_tokens"] = [id_to_token[int(token_id)] for token_id in refined_input_ids[1:]]
+                refined_blocks.append(block)
+
+        refined_song_output = apply_refined_blocks_to_song_output(song_output, refined_blocks)
+        return refined_song_output, architecture_spec
+
+    def _generate_song_output_for_model(
+        self,
+        model: ModelDescriptor,
+        *,
+        chart_input: MetadataInferenceInput,
+        sampling_override: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        if model.inference_kind == "autoregressive":
+            return self._generate_song_output_autoregressive(
+                model,
+                chart_input=chart_input,
+                sampling_override=sampling_override,
+            )
+
+        if model.inference_kind == "hybrid_refine":
+            bootstrap_model = self.get_model(str(model.bootstrap_model_id))
+            bootstrap_song_output, _ = self._generate_song_output_autoregressive(
+                bootstrap_model,
+                chart_input=chart_input,
+                sampling_override=sampling_override,
+            )
+            return self._refine_song_output_with_diffusion_model(
+                model,
+                chart_input=chart_input,
+                song_output=bootstrap_song_output,
+                sampling_override=sampling_override,
+            )
+
+        raise ValueError(f"Unsupported inference_kind '{model.inference_kind}' for model '{model.id}'.")
+
+    def generate(self, request: GenerationRequest, *, output_root: str | Path) -> GenerationResult:
+        model = self.get_model(request.model_id)
+        output_root = Path(output_root).resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        chart_input = self._build_chart_input(request)
+        output_slug = _build_model_output_slug(model)
+        chart_output_dir = output_root / model.id / chart_input.chart_stem
+        chart_output_dir.mkdir(parents=True, exist_ok=True)
+
+        song_output, architecture_spec = self._generate_song_output_for_model(
+            model,
+            chart_input=chart_input,
+            sampling_override=request.sampling_override,
         )
 
         sv_default, vol_default = notes_baseline_from_reference(chart_input.reference_notes_json)
@@ -582,7 +1008,7 @@ class GenerationService:
         ]
         return GenerationResult(
             model=model,
-            chart_stem=chart_stem,
+            chart_stem=chart_input.chart_stem,
             output_dir=chart_output_dir,
             artifacts=artifacts,
         )

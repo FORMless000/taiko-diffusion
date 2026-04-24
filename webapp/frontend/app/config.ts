@@ -9,7 +9,7 @@ declare global {
   }
 }
 
-const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_API_BASE_URL = "https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com";
 
 function normalizeApiBaseUrl(value: string): string {
   const trimmed = String(value || "").trim();

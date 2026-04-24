@@ -17,6 +17,18 @@
       "label": "Sample Large Baseline Maxopt",
       "checkpoint_path": "checkpoints/sample_large_baseline_maxopt/last.ckpt",
       "architecture_name": "taiko_transformer"
+    },
+    {
+      "id": "sample_large_diffusion_hybrid",
+      "label": "Sample Large Diffusion Hybrid",
+      "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/last.ckpt",
+      "architecture_name": "taiko_diffusion_refiner",
+      "inference_kind": "hybrid_refine",
+      "bootstrap_model_id": "sample_large_context",
+      "default_sampling": {
+        "temperature": 1.1,
+        "mask_ratio": 0.25
+      }
     }
   ]
 }

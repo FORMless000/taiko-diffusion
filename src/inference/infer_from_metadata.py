@@ -278,20 +278,18 @@ def _checkpoint_output_slug(checkpoint_path: Path, architecture_name: str) -> st
     return _sanitize_filename_component(label)
 
 
-def load_generator_from_checkpoint(
+def load_inference_model_from_checkpoint(
     checkpoint_path: Path,
     *,
     device,
-    max_decode_len: int,
-    audio_cache_size: int,
-) -> tuple[Any, Any]:
+):
     if torch is None:
         raise RuntimeError("PyTorch is required for checkpoint-based generation. Install torch to run inference.")
     from src.model.checkpoints import load_inference_artifacts
     from src.model.factory import build_model
-    from src.model.generation import TaikoBeatmapGenerator
     from src.model.specs import ArchitectureSpec
 
+    resolved_device = torch.device(device or _default_device())
     payload = load_inference_artifacts(checkpoint_path, map_location="cpu")
     architecture_spec = ArchitectureSpec.from_dict(payload["architecture_spec"])
     vocab_payload = payload["vocab"]
@@ -301,14 +299,32 @@ def load_generator_from_checkpoint(
 
     model = build_model(architecture_spec, vocab_size=len(token_to_id))
     model.load_state_dict(payload["model_state_dict"])
-    model = model.to(device)
+    model = model.to(resolved_device)
     model.eval()
+    return model, architecture_spec, token_to_id, id_to_token
+
+
+def load_generator_from_checkpoint(
+    checkpoint_path: Path,
+    *,
+    device,
+    max_decode_len: int,
+    audio_cache_size: int,
+) -> tuple[Any, Any]:
+    if torch is None:
+        raise RuntimeError("PyTorch is required for checkpoint-based generation. Install torch to run inference.")
+    from src.model.generation import TaikoBeatmapGenerator
+
+    model, architecture_spec, token_to_id, id_to_token = load_inference_model_from_checkpoint(
+        checkpoint_path,
+        device=device,
+    )
 
     generator = TaikoBeatmapGenerator(
         model=model,
         token_to_id=token_to_id,
         id_to_token=id_to_token,
-        device=device,
+        device=next(model.parameters()).device,
         max_len=max_decode_len,
         audio_cache_size=audio_cache_size,
     )

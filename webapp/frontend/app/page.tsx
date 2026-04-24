@@ -4,6 +4,8 @@ import { FormEvent, startTransition, useEffect, useState } from "react";
 
 import { buildApiUrl } from "./config";
 
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
+
 type ModelDescriptor = {
   id: string;
   label: string;
@@ -71,10 +73,43 @@ const DEFAULT_FORM: FormState = {
   tags: "",
 };
 
-function getJobIdFromPath(pathname: string): string | null {
+function withBasePath(pathname: string): string {
+  const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  const basePath = getBasePath(typeof window === "undefined" ? "/" : window.location.pathname);
+  if (!basePath) {
+    return normalized;
+  }
+  if (normalized === "/") {
+    return `${basePath}/`;
+  }
+  return `${basePath}${normalized}`;
+}
+
+function getBasePath(pathname: string): string {
+  if (BASE_PATH) {
+    return BASE_PATH;
+  }
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  const match = normalized.match(/^\/jobs\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
+  if (normalized === "/") {
+    return "";
+  }
+  return normalized;
+}
+
+function getJobIdFromSearch(search: string): string | null {
+  const params = new URLSearchParams(search);
+  const jobId = params.get("job");
+  return jobId ? jobId.trim() || null : null;
+}
+
+function buildAppUrl(jobId: string | null): string {
+  const pathname = withBasePath("/");
+  if (!jobId) {
+    return pathname;
+  }
+  const url = new URL(pathname, "https://example.invalid");
+  url.searchParams.set("job", jobId);
+  return `${url.pathname}${url.search}`;
 }
 
 function formatTimestamp(value: string | null): string {
@@ -333,18 +368,18 @@ export default function Page() {
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
-  const [currentPath, setCurrentPath] = useState("/");
+  const [currentSearch, setCurrentSearch] = useState("");
   const [job, setJob] = useState<JobResponse | null>(null);
   const [jobLoading, setJobLoading] = useState(false);
   const [jobError, setJobError] = useState("");
 
-  const currentJobId = getJobIdFromPath(currentPath);
+  const currentJobId = getJobIdFromSearch(currentSearch);
 
   useEffect(() => {
-    const syncPath = () => setCurrentPath(window.location.pathname);
-    syncPath();
-    window.addEventListener("popstate", syncPath);
-    return () => window.removeEventListener("popstate", syncPath);
+    const syncLocation = () => setCurrentSearch(window.location.search);
+    syncLocation();
+    window.addEventListener("popstate", syncLocation);
+    return () => window.removeEventListener("popstate", syncLocation);
   }, []);
 
   useEffect(() => {
@@ -472,9 +507,9 @@ export default function Page() {
       }
       const payload = (await response.json()) as { job_id: string };
       startTransition(() => {
-        const nextPath = `/jobs/${payload.job_id}`;
-        window.history.pushState({}, "", nextPath);
-        setCurrentPath(nextPath);
+        const nextUrl = buildAppUrl(payload.job_id);
+        window.history.pushState({}, "", nextUrl);
+        setCurrentSearch(new URL(nextUrl, window.location.origin).search);
         setJob(null);
         setJobError("");
       });
@@ -487,8 +522,9 @@ export default function Page() {
 
   function handleBack() {
     startTransition(() => {
-      window.history.pushState({}, "", "/");
-      setCurrentPath("/");
+      const homeUrl = buildAppUrl(null);
+      window.history.pushState({}, "", homeUrl);
+      setCurrentSearch("");
       setJob(null);
       setJobError("");
     });

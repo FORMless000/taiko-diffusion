@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if torch is not None:
     from src.model.factory import build_model
+    from src.model.diffusion_refiner import TaikoDiffusionRefiner
     from src.model.model import TaikoTransformer
     from src.model.specs import ArchitectureSpec
     from src.model.taiko_context import TaikoContextTransformer
@@ -53,6 +54,19 @@ class TestModelFactory(unittest.TestCase):
         self.assertIsInstance(model, TaikoContextTransformer)
         self.assertEqual(model.history_max_tokens, 32)
         self.assertFalse(hasattr(model, "max_cached_charts"))
+
+    def test_builds_diffusion_refiner(self):
+        spec = ArchitectureSpec(
+            name="taiko_diffusion_refiner",
+            d_model=32,
+            nhead=4,
+            num_encoder_layers=1,
+            num_decoder_layers=1,
+            dim_feedforward=64,
+            max_len=2048,
+        )
+        model = build_model(spec, vocab_size=17)
+        self.assertIsInstance(model, TaikoDiffusionRefiner)
 
 
 if __name__ == "__main__":
