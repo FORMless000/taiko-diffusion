@@ -17,6 +17,7 @@ if torch is not None:
     from src.model.checkpoints import (
         CheckpointMetadata,
         capture_rng_states,
+        export_diffusion_inference_bundle,
         load_checkpoint,
         load_inference_artifacts,
         restore_rng_states,
@@ -292,6 +293,55 @@ class TestCheckpoints(unittest.TestCase):
             self.assertEqual(inference_payload["artifact_type"], "training_checkpoint")
             self.assertEqual(inference_payload["metadata"]["global_step"], 4)
             self.assertEqual(inference_payload["vocab"]["token_to_id"], vocab["token_to_id"])
+
+    def test_export_diffusion_inference_bundle_from_raw_checkpoint_and_vocab(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_checkpoint_path = root / "last.ckpt"
+            vocab_path = root / "vocab.pth"
+            bundle_path = root / "inference_bundle.pt"
+
+            spec = ArchitectureSpec(
+                name="taiko_diffusion_refiner",
+                input_dim=128,
+                d_model=16,
+                nhead=4,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                dim_feedforward=32,
+                dropout=0.2,
+                max_len=64,
+            )
+            model = build_model(spec, vocab_size=7)
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            vocab = {
+                "vocab_list": ["PAD", "BOS", "EOS", "MASK", "DON", "KAT", "TS_3"],
+                "token_to_id": {"PAD": 0, "BOS": 1, "EOS": 2, "MASK": 3, "DON": 4, "KAT": 5, "TS_3": 6},
+                "id_to_token": {0: "PAD", 1: "BOS", 2: "EOS", 3: "MASK", 4: "DON", 5: "KAT", 6: "TS_3"},
+            }
+
+            torch.save(
+                {
+                    "epoch": 7,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                raw_checkpoint_path,
+            )
+            torch.save(vocab, vocab_path)
+
+            export_diffusion_inference_bundle(
+                bundle_path,
+                raw_checkpoint_path=raw_checkpoint_path,
+                vocab_path=vocab_path,
+                architecture_spec=spec,
+            )
+
+            payload = load_inference_artifacts(bundle_path, map_location="cpu")
+            self.assertEqual(payload["artifact_type"], "inference_bundle")
+            self.assertEqual(payload["metadata"]["epoch"], 7)
+            self.assertEqual(payload["vocab"]["token_to_id"]["MASK"], 3)
+            self.assertEqual(payload["architecture_spec"]["name"], "taiko_diffusion_refiner")
 
 
 if __name__ == "__main__":

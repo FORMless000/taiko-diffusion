@@ -91,12 +91,40 @@ class TestGenerationServiceHelpers(unittest.TestCase):
         self.assertEqual(
             sorted(registry),
             [
+                "baseline_maxopt_step_055000",
+                "baseline_maxopt_step_055000_diffusion_hybrid",
+                "baseline_snapshot_maxopt",
+                "baseline_snapshot_maxopt_diffusion_hybrid",
                 "sample_large_baseline",
+                "sample_large_baseline_diffusion_hybrid",
                 "sample_large_baseline_maxopt",
+                "sample_large_baseline_maxopt_diffusion_hybrid",
                 "sample_large_context",
+                "sample_large_context_diffusion_hybrid",
+                "sample_large_context_original",
+                "sample_large_context_original_diffusion_hybrid",
             ],
         )
-        self.assertTrue(all(model.checkpoint_path.name == "last.ckpt" for model in registry.values()))
+        self.assertEqual(registry["baseline_maxopt_step_055000"].checkpoint_path.name, "step_055000.pt")
+        self.assertEqual(
+            registry["baseline_maxopt_step_055000_diffusion_hybrid"].bootstrap_model_id,
+            "baseline_maxopt_step_055000",
+        )
+        self.assertEqual(registry["baseline_snapshot_maxopt"].checkpoint_path.name, "last.ckpt")
+        self.assertEqual(
+            registry["baseline_snapshot_maxopt_diffusion_hybrid"].bootstrap_model_id,
+            "baseline_snapshot_maxopt",
+        )
+        self.assertEqual(registry["sample_large_context_diffusion_hybrid"].bootstrap_model_id, "sample_large_context")
+        self.assertEqual(
+            registry["sample_large_context_original_diffusion_hybrid"].bootstrap_model_id,
+            "sample_large_context_original",
+        )
+        self.assertEqual(registry["sample_large_baseline_diffusion_hybrid"].bootstrap_model_id, "sample_large_baseline")
+        self.assertEqual(
+            registry["sample_large_baseline_maxopt_diffusion_hybrid"].bootstrap_model_id,
+            "sample_large_baseline_maxopt",
+        )
 
     def test_load_model_registry_resolves_relative_paths_and_defaults(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -245,6 +273,62 @@ class TestGenerationServiceHelpers(unittest.TestCase):
         self.assertEqual([item["pred_tokens"] for item in restored], [item["pred_tokens"] for item in song_output])
         self.assertEqual([item["pred_ids"] for item in restored], [item["pred_ids"] for item in song_output])
 
+    def test_song_output_refiner_blocks_reencode_time_shifts_for_target_vocab(self):
+        song_output = [
+            {
+                "seq_idx": 0,
+                "start_frame": 0,
+                "end_frame": 191,
+                "pred_ids": [0],
+                "pred_tokens": ["TS_180", "DON"],
+            }
+        ]
+        target_token_to_id = {
+            "PAD": 0,
+            "BOS": 1,
+            "EOS": 2,
+            "MASK": 3,
+            "DON": 4,
+            "TS_36": 5,
+            "TS_144": 6,
+        }
+
+        blocks = convert_song_output_to_refiner_blocks(
+            song_output,
+            windows_per_block=1,
+            target_token_to_id=target_token_to_id,
+        )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["pred_tokens"], ["TS_144", "TS_36", "DON"])
+
+    def test_song_output_refiner_blocks_raise_for_unrepresentable_target_gap(self):
+        song_output = [
+            {
+                "seq_idx": 0,
+                "start_frame": 0,
+                "end_frame": 191,
+                "pred_ids": [0],
+                "pred_tokens": ["TS_4", "DON"],
+            }
+        ]
+        target_token_to_id = {
+            "PAD": 0,
+            "BOS": 1,
+            "EOS": 2,
+            "MASK": 3,
+            "DON": 4,
+            "TS_3": 5,
+            "TS_6": 6,
+        }
+
+        with self.assertRaises(ValueError):
+            convert_song_output_to_refiner_blocks(
+                song_output,
+                windows_per_block=1,
+                target_token_to_id=target_token_to_id,
+            )
+
     def test_mask_note_tokens_for_refinement_masks_only_note_positions(self):
         token_to_id = {
             "PAD": 0,
@@ -354,6 +438,60 @@ class TestGenerationServiceHelpers(unittest.TestCase):
             self.assertEqual(refine_mock.call_count, 1)
             self.assertEqual(result.model.id, "diffusion_hybrid")
             self.assertTrue(any(artifact.kind == "osz" for artifact in result.artifacts))
+
+    def test_generation_service_uses_short_osu_and_osz_filenames(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            audio_path = root / "audio.mp3"
+            checkpoint_path = root / "checkpoints" / "demo" / "last.ckpt"
+            audio_path.write_bytes(b"fake mp3")
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_bytes(b"ckpt")
+
+            model = ModelDescriptor(
+                id="sample_large_context_diffusion_hybrid",
+                label="Hybrid",
+                checkpoint_path=checkpoint_path,
+                architecture_name="taiko_diffusion_refiner",
+                default_sampling={},
+                enabled=True,
+            )
+            service = GenerationService({"sample_large_context_diffusion_hybrid": model})
+
+            request = GenerationRequest(
+                model_id="sample_large_context_diffusion_hybrid",
+                audio_path=audio_path,
+                audio_filename="audio.mp3",
+                metadata=GenerationMetadataInput(title="Title", artist="Artist", version="Oni", creator="Mapper"),
+                timing=GenerationTimingInput(bpm=180.0, offset_ms=0.0, meter=4),
+            )
+            song_output = [
+                {
+                    "seq_idx": 0,
+                    "start_frame": 0,
+                    "end_frame": 191,
+                    "pred_ids": [0],
+                    "pred_tokens": ["DON"],
+                }
+            ]
+
+            def _fake_reconstruct_osu(*, out_path, **kwargs):
+                Path(out_path).write_text("osu file format v14\n", encoding="utf-8")
+
+            with mock.patch.object(
+                service,
+                "_generate_song_output_for_model",
+                return_value=(song_output, type("Spec", (), {"name": "taiko_diffusion_refiner"})()),
+            ), mock.patch("src.inference.service.reconstruct_osu", side_effect=_fake_reconstruct_osu) as reconstruct_mock:
+                result = service.generate(request, output_root=root / "outputs")
+
+            osu_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "osu")
+            osz_artifact = next(artifact for artifact in result.artifacts if artifact.kind == "osz")
+            self.assertTrue(osu_artifact.relative_path.endswith("Artist - Title (Mapper) [Oni].osu"))
+            self.assertTrue(
+                osz_artifact.relative_path.endswith("Artist - Title - sample_large_context_diffusion_hybrid.osz")
+            )
+            reconstruct_mock.assert_called_once()
 
 
 if __name__ == "__main__":

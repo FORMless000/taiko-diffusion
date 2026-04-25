@@ -54,6 +54,8 @@ type FormState = {
   meter: string;
   overallDifficulty: string;
   densityNps: string;
+  beatmapId: string;
+  temperature: string;
   source: string;
   tags: string;
 };
@@ -69,9 +71,25 @@ const DEFAULT_FORM: FormState = {
   meter: "4",
   overallDifficulty: "",
   densityNps: "6.0",
+  beatmapId: "",
+  temperature: "",
   source: "",
   tags: "",
 };
+
+function getModelDefaultTemperature(model: ModelDescriptor | null): string {
+  if (!model) {
+    return "";
+  }
+  const raw = model.default_sampling?.temperature;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return String(raw);
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    return raw.trim();
+  }
+  return "";
+}
 
 function withBasePath(pathname: string): string {
   const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
@@ -174,6 +192,7 @@ function HomeScreen({
 }) {
   const enabledModels = models.filter((model) => model.enabled);
   const selectedModel = enabledModels.find((model) => model.id === form.modelId) ?? enabledModels[0] ?? null;
+  const defaultTemperature = getModelDefaultTemperature(selectedModel);
 
   return (
     <main className="shell">
@@ -250,6 +269,19 @@ function HomeScreen({
                 value={form.densityNps}
                 onChange={(value) => onFormChange("densityNps", value)}
               />
+              <Field
+                label="Beatmap ID"
+                type="number"
+                value={form.beatmapId}
+                onChange={(value) => onFormChange("beatmapId", value)}
+              />
+              <Field
+                label="Temperature"
+                type="number"
+                value={form.temperature}
+                onChange={(value) => onFormChange("temperature", value)}
+                placeholder={defaultTemperature || "1.0"}
+              />
               <Field label="Source" value={form.source} onChange={(value) => onFormChange("source", value)} />
               <Field label="Tags" value={form.tags} onChange={(value) => onFormChange("tags", value)} />
             </div>
@@ -263,6 +295,9 @@ function HomeScreen({
               </div>
               <p className="modelMeta">
                 Outputs: {selectedModel.output_artifact_kinds.join(", ")}
+              </p>
+              <p className="modelMeta">
+                Default temperature: {defaultTemperature || "n/a"}
               </p>
             </div>
           ) : null}
@@ -396,11 +431,13 @@ export default function Page() {
           return;
         }
         const nextModels = payload.models ?? [];
+        const defaultModel = nextModels.find((model) => model.enabled) ?? null;
         setModels(nextModels);
         setModelsError("");
         setForm((current) => ({
           ...current,
-          modelId: current.modelId || nextModels.find((model) => model.enabled)?.id || "",
+          modelId: current.modelId || defaultModel?.id || "",
+          temperature: current.temperature || getModelDefaultTemperature(defaultModel),
         }));
       })
       .catch((error: Error) => {
@@ -487,14 +524,22 @@ export default function Page() {
       const conditioning = {
         density_nps: Number(form.densityNps || "6.0"),
         difficulty_value: form.overallDifficulty ? Number(form.overallDifficulty) : null,
+        beatmap_id: form.beatmapId ? Number(form.beatmapId) : null,
       };
+      const samplingOverride: Record<string, number> = {};
+      if (form.temperature.trim()) {
+        const parsedTemperature = Number(form.temperature);
+        if (!Number.isNaN(parsedTemperature)) {
+          samplingOverride.temperature = parsedTemperature;
+        }
+      }
 
       const requestBody = new FormData();
       requestBody.append("model_id", form.modelId);
       requestBody.append("metadata_json", JSON.stringify(metadata));
       requestBody.append("timing_json", JSON.stringify(timing));
       requestBody.append("conditioning_json", JSON.stringify(conditioning));
-      requestBody.append("sampling_override_json", JSON.stringify({}));
+      requestBody.append("sampling_override_json", JSON.stringify(samplingOverride));
       requestBody.append("audio_file", audioFile);
 
       const response = await fetch(buildApiUrl("/api/jobs"), {

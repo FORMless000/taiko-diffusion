@@ -2,200 +2,138 @@
 
 Automatic osu!taiko beatmap generation from music.
 
-## Summary
+## Project Description
 
-This project is building toward a system that can generate osu!taiko beatmaps directly from audio using a transformer + diffusion pipeline.
+`taiko-diffusion` is a research and engineering project for generating osu!taiko beatmaps from audio. The repository includes the full pipeline from beatmap parsing and beat-aligned dataset construction to model training, checkpoint-backed inference, and a deployable web app.
 
-Right now, the repository contains:
+The current implemented focus is the transformer side of the project: autoregressive transformer baselines and a context transformer variant are trained and wired into the web app. Diffusion is part of the broader project direction and is present in the repo, but it is not the main documented or operational path in this README.
 
-- a preprocessing pipeline that parses `.osu` / `.osz` beatmaps into training-friendly JSON
-- a beat-aligned dataset builder that converts audio + notes into fixed 4-beat training sequences
-- an initial transformer baseline for token generation conditioned on beat-aligned audio features
+For the short project vision, see [PROJECT_INTENT.md](C:/Users/28548/PythonNotebooks/taiko-diffusion/PROJECT_INTENT.md).
 
-Diffusion is still the long-term target rather than the current implemented model.
+## Data Source
 
-## Goals
+The dataset source is ranked osu!taiko beatmap sets.
 
-The project goal is to generate osu!taiko beatmaps from music using transformer + diffusion models.
+- We used all `10,048` ranked beatmap sets for osu!taiko.
+- Download automation used `batch-beatmap-downloader`: <https://github.com/nzbasic/batch-beatmap-downloader>
+- The shared dataset link recorded in this repo is:
+  - <https://www.dropbox.com/scl/fo/ipbgqy80vnithcbhjp33f/ALzhBrzJm013t9gtPpoa9VU?rlkey=kqo1ia6iq6zo1ep4j9usybg1u&st=unov6n5l&dl=0>
+- Manual beatmap-set download is also available through:
+  - <https://osu.ppy.sh/beatmapsets?m=1&s=ranked>
 
-In practice, the current roadmap looks like this:
+Ranked taiko charts were chosen because they are community-reviewed and give higher-quality supervision for beatmap generation.
 
-1. Parse ranked osu!taiko beatmaps into reusable training artifacts.
-2. Build a beat-aligned paired dataset of audio features and tokenized note events.
-3. Train a transformer baseline that predicts note-token sequences from audio.
-4. Use that baseline and dataset design to support a stronger diffusion-based generator later.
+### Repository Data Pipeline
 
-## Data
+The preprocessing pipeline converts raw beatmaps and audio into training-ready paired data:
 
-Dataset:
-
-- We used all 10,048 ranked beatmap sets for osu!taiko, downloaded using `batch-beatmap-downloader`: https://github.com/nzbasic/batch-beatmap-downloader
-- Downloaded dataset is available at https://www.dropbox.com/scl/fo/ipbgqy80vnithcbhjp33f/ALzhBrzJm013t9gtPpoa9VU?rlkey=kqo1ia6iq6zo1ep4j9usybg1u&st=unov6n5l&dl=0
-- Manual download of each beatmap set is avaiilable at https://osu.ppy.sh/beatmapsets?m=1&s=ranked 
-- Only ranked beatmap sets were chosen because they are quality-assured by the community.
-
-Current repository data flow:
-
-1. Raw `.osz` archives are unpacked.
-2. Each taiko chart is parsed into intermediate files:
+1. Unpack raw `.osz` archives.
+2. Parse each taiko chart into:
    - `*.notes.json`
    - `*.timing.json`
    - `*.metadata.json`
-3. Audio is converted into mel-spectrogram features.
-4. Features are interpolated onto a beat-aligned grid with `48` frames per beat.
-5. The aligned audio is split into 4-beat windows with shape `(192, 128)`.
-6. Notes inside each 4-beat window are serialized into token sequences such as `TS_24`, `DON`, `KAT`, `BIGDON`, `BIGKAT`, `DRUMROLL`, `SLIDERSTART`, and `SLIDEREND`.
+3. Convert audio into mel-spectrogram features.
+4. Interpolate audio onto a beat-aligned grid with `48` frames per beat.
+5. Split aligned audio into 4-beat windows with shape `(192, 128)`.
+6. Serialize note timing and note events into token sequences using `TS_*` and event tokens such as `DON`, `KAT`, `BIGDON`, `BIGKAT`, `DRUMROLL`, `SLIDERSTART`, and `SLIDEREND`.
 
-The beat-aligned dataset builder writes:
+The beat-aligned dataset builder writes artifacts such as:
 
 - `beat_aligned_dataset/audio_npz/*.npz`
 - `beat_aligned_dataset/token_json/*.json`
 - `beat_aligned_dataset/sequence_metadata.csv`
-- chart-level summaries under `chart_index/`
+- chart summaries under `chart_index/`
 
-## Current Progress
+## Required Packages
 
-The project has moved beyond a minimal parser scaffold.
+### Install Commands
 
-- `data_preprocessing.ipynb` demonstrates parsing and reconstruction of osu!taiko charts.
-- [`beat_aligned_dataset.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/beat_aligned_dataset.ipynb) implements the full beat-aligned dataset pipeline.
-- [`otsu_Transformer.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb) implements an encoder-decoder transformer baseline for sequence prediction and sample generation.
-- The shared logic has also been moved into reusable Python modules under [`src/preprocessing`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing) and [`src/model`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model).
-
-From the notebook runs currently saved in the repo:
-
-- the beat-aligned pipeline was run on a subset of `102` folders / `290` chart triples
-- that run produced `31,119` training sequences
-- the derived vocabulary size was `82`
-- the transformer notebook shows early baseline training and qualitative token-generation examples
-
-## Pipeline
-
-### 1. Parse and reconstruct charts
-
-The parser in [`src/preprocessing/osutaiko_parser.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing/osutaiko_parser.py) converts an osu!taiko `.osu` file into:
-
-- note events for training
-- timing-point reference data
-- metadata needed for reconstruction
-
-The reconstructor in [`src/preprocessing/osutaiko_reconstructor.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing/osutaiko_reconstructor.py) can rebuild a `.osu` file from those exported artifacts.
-
-### 2. Build a beat-aligned dataset
-
-The beat-aligned dataset builder in [`src/preprocessing/beat_aligned_dataset.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing/beat_aligned_dataset.py) does the following for each chart:
-
-1. Match one audio file with one parsed chart triple.
-2. Read timing and construct a beat grid.
-3. Map note events onto beat-relative frame indices.
-4. Compute mel spectrograms from audio.
-5. Interpolate the spectrogram onto the beat-aligned timeline.
-6. Split the aligned audio into 4-beat sequences.
-7. Convert note events into per-sequence token lists.
-
-Current dataset settings:
-
-- `48` frames per beat
-- `4` beats per sequence
-- `192` frames per sequence
-- `128` mel bins
-
-### 3. Train a transformer baseline
-
-The baseline model in [`src/model/model.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/model.py) is a transformer encoder-decoder:
-
-- encoder input: beat-aligned audio sequence `(192, 128)`
-- decoder input: autoregressive note tokens
-- output: the next token in the chart sequence
-
-Supporting code lives in:
-
-- [`src/model/data.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/data.py) for manifests, splits, vocabulary, dataset, and collation
-- [`src/model/trainer.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/trainer.py) for training and validation loops
-- [`src/model/generation.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model/generation.py) for greedy decoding and song-level generation
-
-## Quick Start
-
-1. Install the package:
+Core Python package:
 
 ```bash
 pip install -e .
 ```
 
-2. Unpack `.osz` files:
-
-```bash
-python src/preprocessing/unpack_osz.py
-```
-
-3. Parse and reconstruct sample beatmaps:
-
-- open [`data_preprocessing.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/data_preprocessing.ipynb) and run the notebook
-
-4. Build the beat-aligned dataset:
-
-- open [`beat_aligned_dataset.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/beat_aligned_dataset.ipynb) and run the pipeline cells
-
-5. Train or inspect the transformer baseline:
-
-- open [`otsu_Transformer.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb)
-
-## W&B Setup
-
-For notebook and CLI logging without interactive prompts:
-
-1. Install dependencies:
-
-```bash
-pip install -e .
-```
-
-Optional W&B support:
-
-```bash
-pip install -e .[wandb]
-```
-
-2. Configure W&B environment variables (copy from `.env.wandb.example`):
-
-```bash
-set WANDB_API_KEY=your_key_here
-set WANDB_NOTEBOOK_NAME=train_context_raw_data.ipynb
-set WANDB_DIR=.wandb
-```
-
-You can also pass API key directly by parameter (no environment setup), e.g. `--wandb-api-key <key>` in training CLI.
-
-3. Use [`wandb_debug.ipynb`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/wandb_debug.ipynb) to verify setup before long training runs.
-
-## Repository Layout
-
-- [`src/preprocessing`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing): unpacking, parsing, reconstruction, and beat-aligned dataset building
-- [`src/model`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/model): transformer baseline, data utilities, training loop, and generation helpers
-- [`src/inference`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference): checkpoint-backed inference helpers, metadata-driven generation service, and `.osz` packaging
-- [`webapp`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/webapp): FastAPI backend, Next.js frontend, and runtime job workspace for deployment
-- [`sample_data`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/sample_data): small local examples for parser/reconstruction work
-- notebooks: exploratory and milestone notebooks for preprocessing, dataset creation, analysis, and modeling
-
-## Web App
-
-The repo now includes a deployable web app under [`webapp`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/webapp).
-
-- The backend is a FastAPI app with a single-worker queue and file-backed job store.
-- The frontend is a Next.js app that submits generation jobs, polls status, and downloads the generated `.osz`.
-- The reusable generation service lives in [`src/inference/service.py`](/c:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference/service.py) so the backend calls Python library code directly instead of shelling out to notebooks or CLI scripts.
-
-Install the optional backend dependencies:
+Web app backend extras:
 
 ```bash
 pip install -e .[webapp]
 ```
 
-Build the frontend:
+Optional W&B logging extras:
+
+```bash
+pip install -e .[wandb]
+```
+
+Frontend dependencies:
 
 ```bash
 cd webapp/frontend
 npm install
+```
+
+### Key Packages Used
+
+Python core:
+
+- `torch`
+- `numpy`
+- `pandas`
+- `librosa`
+- `scikit-learn`
+- `matplotlib`
+- `tqdm`
+
+Web backend:
+
+- `fastapi`
+- `uvicorn`
+- `python-multipart`
+
+Frontend:
+
+- `next`
+- `react`
+- `react-dom`
+- `typescript`
+
+The canonical dependency declarations live in:
+
+- [pyproject.toml](C:/Users/28548/PythonNotebooks/taiko-diffusion/pyproject.toml)
+- [webapp/frontend/package.json](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/frontend/package.json)
+
+## How To Run The Code
+
+### 1. Preprocessing And Dataset Construction
+
+Unpack beatmap archives:
+
+```bash
+python src/preprocessing/unpack_osz.py
+```
+
+Then use the notebooks and shared modules to inspect parsing and build beat-aligned data:
+
+- [data_preprocessing.ipynb](C:/Users/28548/PythonNotebooks/taiko-diffusion/data_preprocessing.ipynb)
+- [beat_aligned_dataset.ipynb](C:/Users/28548/PythonNotebooks/taiko-diffusion/beat_aligned_dataset.ipynb)
+
+### 2. Training / Model Inspection
+
+The model code lives under:
+
+- [src/model](C:/Users/28548/PythonNotebooks/taiko-diffusion/src/model)
+
+The repo includes training notebooks for the baseline and context models, including large-sample, maxopt, and snapshot variants. The original exploratory transformer notebook is:
+
+- [otsu_Transformer.ipynb](C:/Users/28548/PythonNotebooks/taiko-diffusion/otsu_Transformer.ipynb)
+
+### 3. Local Web App Inference
+
+Build the frontend:
+
+```bash
+cd webapp/frontend
 npm run build
 ```
 
@@ -205,9 +143,56 @@ Run the backend:
 python -m webapp.backend.main
 ```
 
+This starts the FastAPI service on `http://127.0.0.1:8000`.
+
+Useful endpoints:
+
+- `GET /api/models`
+- `POST /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/download/osz`
+
+The backend serves its model list from [webapp/backend/models.json](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/backend/models.json). That manifest currently includes multiple AR/context checkpoints plus diffusion-hybrid model options layered on top of them.
+
+### 4. Web App Inputs
+
+The frontend accepts:
+
+- required fields:
+  - audio file
+  - title
+  - artist
+  - difficulty name
+  - BPM
+  - offset
+- advanced fields:
+  - overall difficulty
+  - density NPS
+  - beatmap ID
+  - temperature
+  - creator
+  - source
+  - tags
+
+Important notes:
+
+- `beatmap_id` is used as a model conditioning / auditing input, not normal beatmap metadata for the user.
+- `temperature` is passed through sampling overrides at inference time.
+- current inference assumes constant-BPM timing.
+
+## Repository Layout
+
+- [src/preprocessing](C:/Users/28548/PythonNotebooks/taiko-diffusion/src/preprocessing): unpacking, parsing, reconstruction, and beat-aligned dataset building
+- [src/model](C:/Users/28548/PythonNotebooks/taiko-diffusion/src/model): transformer models, datasets, training logic, and generation helpers
+- [src/inference](C:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference): checkpoint-backed inference and generation service logic
+- [webapp](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp): FastAPI backend, Next.js frontend, job runtime workspace, and deployment helpers
+- [sample_data](C:/Users/28548/PythonNotebooks/taiko-diffusion/sample_data): local parser/reconstruction examples
+
+For deployment and operational web app details, see [webapp/README.md](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/README.md).
+
 ## Current Limitations
 
-- The current beat-aligned dataset builder only supports constant-BPM charts; charts with BPM changes are rejected during dataset creation.
-- The metadata-driven inference and web app currently support only constant-BPM timing payloads.
-- Several notebooks and scripts still use machine-specific absolute paths and are not yet packaged as a clean end-to-end CLI workflow.
-- The implemented model is currently a transformer baseline; diffusion training/inference is still future work.
+- The beat-aligned dataset builder currently supports only constant-BPM charts.
+- The web app and metadata-driven inference path also currently assume constant-BPM timing.
+- Several notebooks still use machine-specific paths and remain part of the research workflow rather than a polished end-to-end CLI.
+- The repo direction includes diffusion, but the main mature path today is the transformer AR/context pipeline.

@@ -1,66 +1,140 @@
 # Web App
 
-This folder contains a deployable web interface for `taiko-diffusion`.
+This folder contains the deployable web interface for `taiko-diffusion`.
+
+It is intentionally narrower in scope than the top-level README: this document focuses on running, operating, and deploying the web app rather than explaining the whole research pipeline.
 
 ## Layout
 
-- `backend/`: FastAPI API, single-worker job queue, filesystem job store.
-- `frontend/`: Next.js UI that talks to the API and can be exported to static files.
-- `runtime/jobs/`: local working directory for uploads, generated files, and job status JSON.
+- `backend/`: FastAPI API, single-worker job queue, and filesystem job store
+- `frontend/`: Next.js frontend exported as static files
+- `runtime/jobs/`: uploaded files, saved request payloads, job status JSON, and generated outputs
+- `aws/`: deployment helpers such as the HTTPS bridge setup script
 
 ## Install
+
+Python backend dependencies:
 
 ```bash
 pip install -e .[webapp]
 ```
+
+Frontend dependencies:
 
 ```bash
 cd webapp/frontend
 npm install
 ```
 
-## Run In Development
+## Run Locally
 
-Backend:
+### Backend
 
-```bash
-python -m uvicorn webapp.backend.main:app --host 127.0.0.1 --port 8000
-```
-
-Frontend:
+Run the backend:
 
 ```bash
-cd webapp/frontend
-npm run build
-python -m http.server 3000 --bind 127.0.0.1 --directory out
+python -m webapp.backend.main
 ```
 
-Update the static frontend runtime config before serving it:
+This serves the API on `http://127.0.0.1:8000`.
 
-```bash
-webapp/frontend/public/config.js
-```
+### Frontend Build
 
-Default contents:
-
-```js
-window.__TAIKO_CONFIG__ = {
-  apiBaseUrl: "https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com"
-};
-```
-
-This file is copied into the exported static site, so you can point the same build at a different backend host or port without changing application code.
-
-## Build For FastAPI Static Hosting
+Build the static frontend:
 
 ```bash
 cd webapp/frontend
 npm run build
 ```
 
-After the build writes `webapp/frontend/out/`, the app can be served from a plain static host. Job pages use `?job=<job_id>`, so the host does not need SPA rewrite support for `/jobs/<job_id>` paths.
+The exported frontend is written to:
 
-## Local Launch Scripts
+- `webapp/frontend/out/`
+
+The backend can serve that exported site directly.
+
+## Runtime Config
+
+The exported frontend reads its runtime API host from:
+
+- [webapp/frontend/out/config.js](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/frontend/out/config.js)
+
+The currently checked-in value points to:
+
+- `https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com`
+
+If you deploy the app to another backend host, update the frontend config and rebuild or replace the exported assets.
+
+## Model Registry Behavior
+
+The frontend model dropdown is populated from:
+
+- [webapp/backend/models.json](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/backend/models.json)
+
+The backend returns that manifest through:
+
+- `GET /api/models`
+
+If the manifest is missing or invalid, the backend falls back to the built-in model registry in:
+
+- [src/inference/service.py](C:/Users/28548/PythonNotebooks/taiko-diffusion/src/inference/service.py)
+
+Current model behavior to keep in mind:
+
+- `sample_large_context` is the maxopt context checkpoint
+- `sample_large_context_original` is the original context checkpoint
+- several baseline AR checkpoints are also exposed
+- diffusion-hybrid entries exist as separate selectable model options
+
+## Current UI Behavior
+
+The web UI accepts:
+
+- required fields:
+  - model
+  - MP3
+  - title
+  - artist
+  - difficulty name
+  - BPM
+  - offset
+- advanced fields:
+  - creator
+  - meter
+  - overall difficulty
+  - density NPS
+  - beatmap ID
+  - temperature
+  - source
+  - tags
+
+Operational notes:
+
+- `beatmap_id` is used as a conditioning/auditing input for the model, not as ordinary user-facing beatmap metadata
+- `temperature` is sent through sampling overrides
+- inference currently assumes constant-BPM timing
+
+## Job And Artifact Flow
+
+Submitted jobs are written under:
+
+- `webapp/runtime/jobs`
+
+Each job stores:
+
+- uploaded audio
+- `request.json`
+- `status.json`
+- generated artifacts such as `.osu`, `.osz`, metadata JSON, timing JSON, notes JSON, and song-output JSON
+
+Useful API routes:
+
+- `GET /api/models`
+- `POST /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/download/osz`
+
+## Local Helper Scripts
 
 Convenience scripts are included under `webapp/scripts/`:
 
@@ -71,42 +145,52 @@ Convenience scripts are included under `webapp/scripts/`:
 - `set-frontend-api-config.ps1`
 - `set-frontend-api-config.sh`
 
-They:
+These help with:
 
-- write `webapp/frontend/public/config.js` with your chosen backend URL
-- run the static frontend export build
-- start the backend over plain HTTP
-- start a plain HTTP static server for `webapp/frontend/out`
+- writing frontend runtime config
+- rebuilding the static frontend
+- starting the backend
+- serving the exported frontend
 
 ## AWS HTTPS Bridge
 
-To bridge your local backend through the AWS FRP server with HTTPS:
+For the current EC2 deployment flow, use:
 
-1. Start the backend locally on `127.0.0.1:12205`.
-2. Start `frpc` with `webapp/frpc.toml`.
-3. Copy `webapp/aws/setup-https-bridge.sh` to the AWS Ubuntu/Debian server and run it with `sudo`.
+- [webapp/aws/setup-https-bridge.sh](C:/Users/28548/PythonNotebooks/taiko-diffusion/webapp/aws/setup-https-bridge.sh)
 
-The setup script:
+That script is designed for a setup where:
 
-- verifies `frps` is already running
-- checks ports `443`, `80`, and `12205`
+- the backend is already being published through FRP
+- an EC2 host terminates HTTPS with Caddy
+
+The script:
+
+- checks for an active `frps`
 - installs Caddy if needed
-- configures Caddy to request a normal certificate for `ec2-18-117-249-161.us-east-2.compute.amazonaws.com`
-- reverse proxies `https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com` to `http://127.0.0.1:12205`
+- verifies that the local backend proxy port is reachable
+- writes the Caddy reverse-proxy block
+- configures firewall rules when `ufw` is active
 - restarts Caddy and prints verification commands
 
-Update the frontend runtime config with either helper script:
-
-PowerShell:
-
-```powershell
-.\webapp\scripts\set-frontend-api-config.ps1 -ApiBaseUrl https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com
-```
-
-Bash:
+Example usage on the EC2 host:
 
 ```bash
-API_BASE_URL=https://ec2-18-117-249-161.us-east-2.compute.amazonaws.com ./webapp/scripts/set-frontend-api-config.sh
+sudo PUBLIC_HOST=your.domain.example BACKEND_PROXY_PORT=12205 bash webapp/aws/setup-https-bridge.sh
 ```
 
-This hostname path only works if the EC2 DNS name is reachable publicly on ports 80 and 443 and Caddy can complete ACME validation.
+Typical verification:
+
+```bash
+curl -v https://your.domain.example/api/models
+sudo journalctl -u caddy -n 50 --no-pager
+```
+
+Deployment assumptions:
+
+- DNS for the public host points to the EC2 instance
+- AWS security groups allow ports `80` and `443`
+- FRP is already configured to expose the backend on the chosen proxy port
+
+## Limitation Reminder
+
+The web app currently supports constant-BPM generation only.

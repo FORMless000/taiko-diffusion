@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -56,6 +57,7 @@ DEFAULT_INPUT_FIELDS = [
     {"id": "meter", "label": "Meter", "kind": "number", "required": False, "advanced": True},
     {"id": "overall_difficulty", "label": "Overall Difficulty", "kind": "number", "required": False, "advanced": True},
     {"id": "density_nps", "label": "Density NPS", "kind": "number", "required": False, "advanced": True},
+    {"id": "beatmap_id", "label": "Beatmap ID", "kind": "number", "required": False, "advanced": True},
     {"id": "source", "label": "Source", "kind": "text", "required": False, "advanced": True},
     {"id": "tags", "label": "Tags", "kind": "text", "required": False, "advanced": True},
 ]
@@ -262,8 +264,14 @@ def built_in_model_registry(repo_root: str | Path | None = None) -> dict[str, Mo
     models = [
         {
             "id": "sample_large_context",
-            "label": "Sample Large Context",
+            "label": "Sample Large Context Maxopt",
             "checkpoint_path": "checkpoints/sample_large_context/last.ckpt",
+            "architecture_name": "taiko_context_transformer",
+        },
+        {
+            "id": "sample_large_context_original",
+            "label": "Sample Large Context Original",
+            "checkpoint_path": "checkpoints/sample_large_context_original/last.ckpt",
             "architecture_name": "taiko_context_transformer",
         },
         {
@@ -277,6 +285,90 @@ def built_in_model_registry(repo_root: str | Path | None = None) -> dict[str, Mo
             "label": "Sample Large Baseline Maxopt",
             "checkpoint_path": "checkpoints/sample_large_baseline_maxopt/last.ckpt",
             "architecture_name": "taiko_transformer",
+        },
+        {
+            "id": "baseline_maxopt_step_055000",
+            "label": "Baseline Maxopt Step 055000",
+            "checkpoint_path": "checkpoints/baseline_maxopt/inference_snapshots/step_055000.pt",
+            "architecture_name": "taiko_transformer",
+        },
+        {
+            "id": "baseline_snapshot_maxopt",
+            "label": "Baseline Snapshot Maxopt",
+            "checkpoint_path": "checkpoints/baseline_snapshot_maxopt/last.ckpt",
+            "architecture_name": "taiko_transformer",
+        },
+        {
+            "id": "sample_large_context_diffusion_hybrid",
+            "label": "Sample Large Context Maxopt + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "sample_large_context",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
+        },
+        {
+            "id": "sample_large_context_original_diffusion_hybrid",
+            "label": "Sample Large Context Original + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "sample_large_context_original",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
+        },
+        {
+            "id": "sample_large_baseline_diffusion_hybrid",
+            "label": "Sample Large Baseline + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "sample_large_baseline",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
+        },
+        {
+            "id": "sample_large_baseline_maxopt_diffusion_hybrid",
+            "label": "Sample Large Baseline Maxopt + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "sample_large_baseline_maxopt",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
+        },
+        {
+            "id": "baseline_maxopt_step_055000_diffusion_hybrid",
+            "label": "Baseline Maxopt Step 055000 + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "baseline_maxopt_step_055000",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
+        },
+        {
+            "id": "baseline_snapshot_maxopt_diffusion_hybrid",
+            "label": "Baseline Snapshot Maxopt + Diffusion",
+            "checkpoint_path": "checkpoints/sample_large_diffusion_refiner/inference_bundle.pt",
+            "architecture_name": "taiko_diffusion_refiner",
+            "inference_kind": "hybrid_refine",
+            "bootstrap_model_id": "baseline_snapshot_maxopt",
+            "default_sampling": {
+                "temperature": 1.1,
+                "mask_ratio": 0.25,
+            },
         },
     ]
     registry = {payload["id"]: _coerce_model_descriptor(payload, repo_root=root) for payload in models}
@@ -434,6 +526,13 @@ def _build_model_output_slug(model: ModelDescriptor) -> str:
     return _sanitize_filename_component("_".join(str(part) for part in parts if str(part).strip()))
 
 
+def _build_short_osz_filename(metadata: GenerationMetadataInput, model: ModelDescriptor) -> str:
+    artist = _sanitize_filename_component(metadata.artist or "Unknown Artist") or "Unknown Artist"
+    title = _sanitize_filename_component(metadata.title or "Untitled") or "Untitled"
+    model_name = _sanitize_filename_component(model.id or model.label or "model") or "model"
+    return f"{artist} - {title} - {model_name}.osz"
+
+
 def _build_sampling_config(model: ModelDescriptor, overrides: dict[str, Any] | None):
     from src.model.generation import SamplingConfig
 
@@ -489,7 +588,71 @@ def _song_events_from_tokens(tokens: list[str], *, start_frame: int) -> list[tup
     return events
 
 
-def _tokens_from_song_events(events: list[tuple[int, str]], *, start_frame: int) -> list[str]:
+def extract_ts_steps_from_vocab(token_to_id: dict[str, int]) -> list[int]:
+    steps = []
+    for token in token_to_id:
+        token_text = str(token).strip().upper()
+        if not token_text.startswith("TS_"):
+            continue
+        try:
+            step = int(token_text[3:])
+        except ValueError:
+            continue
+        if step > 0:
+            steps.append(step)
+    return sorted(set(steps))
+
+
+@lru_cache(maxsize=None)
+def _canonical_time_shift_steps(delta: int, available_steps: tuple[int, ...]) -> tuple[int, ...]:
+    if delta < 0:
+        raise ValueError("delta must be non-negative.")
+    if delta == 0:
+        return ()
+    if not available_steps:
+        raise ValueError("available_steps must not be empty.")
+
+    best: list[list[int] | None] = [None] * (delta + 1)
+    best[0] = []
+    for total in range(1, delta + 1):
+        candidate_best: list[int] | None = None
+        for step in available_steps:
+            if step > total:
+                break
+            prev = best[total - step]
+            if prev is None:
+                continue
+            candidate = list(prev) + [int(step)]
+            if candidate_best is None:
+                candidate_best = candidate
+                continue
+            candidate_key = (len(candidate), tuple(-item for item in candidate))
+            best_key = (len(candidate_best), tuple(-item for item in candidate_best))
+            if candidate_key < best_key:
+                candidate_best = candidate
+
+        best[total] = candidate_best
+
+    resolved = best[delta]
+    if resolved is None:
+        raise ValueError(f"Cannot encode frame delta {delta} with TS vocabulary {list(available_steps)}.")
+    return tuple(resolved)
+
+
+def _encode_time_shift_tokens(delta: int, *, available_steps: list[int] | None = None) -> list[str]:
+    if delta <= 0:
+        return []
+    if not available_steps:
+        return [f"TS_{delta}"]
+    return [f"TS_{step}" for step in _canonical_time_shift_steps(int(delta), tuple(int(step) for step in available_steps))]
+
+
+def _tokens_from_song_events(
+    events: list[tuple[int, str]],
+    *,
+    start_frame: int,
+    available_ts_steps: list[int] | None = None,
+) -> list[str]:
     if not events:
         return []
 
@@ -500,7 +663,7 @@ def _tokens_from_song_events(events: list[tuple[int, str]], *, start_frame: int)
         local_frame = max(0, int(frame) - int(start_frame))
         delta = local_frame - prev_local_frame
         if delta > 0:
-            tokens.append(f"TS_{delta}")
+            tokens.extend(_encode_time_shift_tokens(delta, available_steps=available_ts_steps))
         tokens.append(token)
         prev_local_frame = local_frame
     return tokens
@@ -510,10 +673,12 @@ def convert_song_output_to_refiner_blocks(
     song_output: list[dict[str, Any]],
     *,
     windows_per_block: int = WINDOWS_PER_REFINER_BLOCK,
+    target_token_to_id: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     ordered = sorted(song_output, key=lambda item: int(item.get("seq_idx", 0)))
     if windows_per_block <= 0:
         raise ValueError("windows_per_block must be positive.")
+    target_ts_steps = None if target_token_to_id is None else extract_ts_steps_from_vocab(target_token_to_id)
 
     blocks: list[dict[str, Any]] = []
     full_block_count = len(ordered) // windows_per_block
@@ -530,7 +695,11 @@ def convert_song_output_to_refiner_blocks(
                 "seq_start_idx": int(chunk[0]["seq_idx"]),
                 "start_frame": start_frame,
                 "end_frame": end_frame,
-                "pred_tokens": _tokens_from_song_events(events, start_frame=start_frame),
+                "pred_tokens": _tokens_from_song_events(
+                    events,
+                    start_frame=start_frame,
+                    available_ts_steps=target_ts_steps,
+                ),
             }
         )
     return blocks
@@ -832,7 +1001,10 @@ class GenerationService:
             bpm=chart_input.bpm,
             meter=chart_input.meter,
         )
-        refiner_blocks = convert_song_output_to_refiner_blocks(song_output)
+        refiner_blocks = convert_song_output_to_refiner_blocks(
+            song_output,
+            target_token_to_id=token_to_id,
+        )
         if not audio_blocks or not refiner_blocks:
             return song_output, architecture_spec
 
@@ -845,6 +1017,12 @@ class GenerationService:
             for block_idx in range(full_block_count):
                 block = dict(refiner_blocks[block_idx])
                 raw_tokens = list(block.get("pred_tokens", []))
+                missing_tokens = [token for token in raw_tokens if token not in token_to_id]
+                if missing_tokens:
+                    raise ValueError(
+                        f"Hybrid refiner model '{model.id}' is missing tokens required for refinement: "
+                        f"{sorted(set(missing_tokens))}"
+                    )
                 input_ids = [int(token_to_id["BOS"])] + [int(token_to_id[token]) for token in raw_tokens]
                 masked_ids, mask_positions = mask_note_tokens_for_refinement(
                     input_ids,
@@ -946,8 +1124,8 @@ class GenerationService:
         timing_path = chart_output_dir / f"{chart_input.chart_stem}.{output_slug}.generated.timing.json"
         metadata_path = chart_output_dir / f"{chart_input.chart_stem}.{output_slug}.generated.metadata.json"
         song_output_path = chart_output_dir / f"{chart_input.chart_stem}.{output_slug}.song_output.json"
-        osu_path = chart_output_dir / f"{_build_osu_filename_from_version(chart_input.chart_stem, str(generated_metadata.get('metadata', {}).get('Version', 'Generated')))[:-4]}.{output_slug}.osu"
-        osz_path = chart_output_dir / f"{chart_input.chart_stem}.{output_slug}.generated.osz"
+        osu_path = chart_output_dir / f"{chart_input.chart_stem}.osu"
+        osz_path = chart_output_dir / _build_short_osz_filename(request.metadata, model)
 
         _write_json(notes_path, generated_notes)
         _write_json(timing_path, generated_timing)

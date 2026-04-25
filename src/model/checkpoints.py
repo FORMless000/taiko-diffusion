@@ -176,3 +176,84 @@ def load_inference_artifacts(checkpoint_path: str | Path, map_location: str | to
 def load_checkpoint(checkpoint_path: str | Path, map_location: str | torch.device | None = None) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_path)
     return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+
+
+def diffusion_refiner_architecture_spec() -> ArchitectureSpec:
+    return ArchitectureSpec(
+        name="taiko_diffusion_refiner",
+        input_dim=128,
+        d_model=256,
+        nhead=4,
+        num_encoder_layers=4,
+        num_decoder_layers=4,
+        dim_feedforward=1024,
+        dropout=0.3,
+        max_len=2048,
+    )
+
+
+def normalize_vocab_payload(vocab: dict[str, Any]) -> dict[str, Any]:
+    vocab_list = [str(token) for token in list(vocab.get("vocab_list", []))]
+    token_to_id_raw = dict(vocab.get("token_to_id", {}) or {})
+    id_to_token_raw = dict(vocab.get("id_to_token", {}) or {})
+
+    token_to_id = {str(token): int(idx) for token, idx in token_to_id_raw.items()}
+    id_to_token = {int(idx): str(token) for idx, token in id_to_token_raw.items()}
+    if not vocab_list:
+        vocab_list = [token for token, _ in sorted(token_to_id.items(), key=lambda item: item[1])]
+
+    for token, idx in token_to_id.items():
+        id_to_token.setdefault(int(idx), str(token))
+    for idx, token in id_to_token.items():
+        token_to_id.setdefault(str(token), int(idx))
+
+    if len(vocab_list) != len(token_to_id):
+        vocab_list = [token for token, _ in sorted(token_to_id.items(), key=lambda item: item[1])]
+
+    return {
+        "vocab_list": vocab_list,
+        "token_to_id": token_to_id,
+        "id_to_token": id_to_token,
+    }
+
+
+def export_diffusion_inference_bundle(
+    bundle_path: str | Path,
+    *,
+    raw_checkpoint_path: str | Path,
+    vocab_path: str | Path,
+    architecture_spec: ArchitectureSpec | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    from .factory import build_model
+
+    raw_checkpoint_path = Path(raw_checkpoint_path).resolve()
+    vocab_path = Path(vocab_path).resolve()
+    bundle_path = Path(bundle_path).resolve()
+
+    raw_payload = load_checkpoint(raw_checkpoint_path, map_location="cpu")
+    if "model_state_dict" not in raw_payload:
+        raise ValueError(f"Checkpoint at '{raw_checkpoint_path}' does not contain model_state_dict.")
+
+    vocab_payload = normalize_vocab_payload(load_checkpoint(vocab_path, map_location="cpu"))
+    if "MASK" not in vocab_payload["token_to_id"]:
+        raise ValueError(f"Diffusion vocabulary at '{vocab_path}' is missing MASK.")
+
+    resolved_spec = architecture_spec or diffusion_refiner_architecture_spec()
+    model = build_model(resolved_spec, vocab_size=len(vocab_payload["token_to_id"]))
+    model.load_state_dict(raw_payload["model_state_dict"])
+
+    merged_metadata = {
+        "source_checkpoint": str(raw_checkpoint_path),
+        "source_vocab": str(vocab_path),
+        **(metadata or {}),
+    }
+    return save_inference_bundle(
+        bundle_path,
+        model=model,
+        architecture_spec=resolved_spec,
+        vocab=vocab_payload,
+        global_step=int(raw_payload.get("global_step", 0)),
+        epoch=None if raw_payload.get("epoch") is None else int(raw_payload["epoch"]),
+        metadata=merged_metadata,
+    )
