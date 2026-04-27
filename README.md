@@ -2,6 +2,13 @@
 
 Automatic osu!taiko beatmap generation from music.
 
+Quick backend start from the repo root:
+
+- PowerShell: `.\main.ps1`
+- Bash: `./main.sh`
+
+Both scripts boot the FastAPI backend on `0.0.0.0:12205` by default.
+
 ## Project Description
 
 `taiko-diffusion` is a research and engineering project for generating osu!taiko beatmaps from audio. The repository includes the full pipeline from beatmap parsing and beat-aligned dataset construction to model training, checkpoint-backed inference, and a deployable web app.

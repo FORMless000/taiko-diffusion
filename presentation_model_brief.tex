@@ -1,0 +1,318 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsfonts, mathtools}
+\usepackage{bm}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{parskip}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\title{Model Brief For Presentation}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{Main Idea}
+
+The core model is an audio-conditioned autoregressive transformer for osu!taiko chart generation.
+
+\begin{itemize}[leftmargin=1.5em]
+    \item Input: beat-aligned mel-spectrogram window $X \in \mathbb{R}^{192 \times 128}$
+    \item Output: token sequence $\mathbf{y} = (y_1, \dots, y_T)$ containing timing tokens such as \texttt{TS\_*} and event tokens such as \texttt{DON}, \texttt{KAT}, \texttt{BIGDON}, and \texttt{BIGKAT}
+    \item Goal: model the conditional distribution
+\end{itemize}
+
+\[
+p(\mathbf{y} \mid X) = \prod_{t=1}^{T} p(y_t \mid y_{<t}, X)
+\]
+
+So the model listens to a short audio window, then writes the chart token by token.
+
+\section*{AR Transformer}
+
+The baseline is an encoder-decoder transformer.
+
+\begin{itemize}[leftmargin=1.5em]
+    \item Audio encoder:
+    \begin{itemize}[leftmargin=1.5em]
+        \item project mel features into model space
+        \item add positional encoding
+        \item encode with transformer self-attention
+    \end{itemize}
+    \item Token decoder:
+    \begin{itemize}[leftmargin=1.5em]
+        \item embed previous tokens
+        \item add positional encoding
+        \item apply causal self-attention
+        \item cross-attend to encoded audio
+        \item predict the next token
+    \end{itemize}
+\end{itemize}
+
+Compact math:
+
+\[
+H = \mathrm{Enc}(\mathrm{PE}(X W_a))
+\]
+
+\[
+E_{<t} = \mathrm{PE}(\mathrm{TokEmb}(y_{<t}))
+\]
+
+\[
+h_t = \mathrm{Dec}(E_{<t}, H)
+\]
+
+\[
+p(y_t \mid y_{<t}, X) = \mathrm{softmax}(W_o h_t + b_o)
+\]
+
+Training objective:
+
+\[
+\mathcal{L}_{\mathrm{AR}} = - \sum_{t=1}^{T} \log p(y_t^{\ast} \mid y_{<t}^{\ast}, X)
+\]
+
+This is standard teacher-forced cross-entropy over the target token sequence.
+
+\section*{Metadata Conditioning}
+
+The decoder also receives three global conditioning signals:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item difficulty
+    \item density
+    \item beatmap ID as a style / identity proxy
+\end{itemize}
+
+Let:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $d_{\mathrm{diff}}$ be the difficulty number after scaling it into a range the model can use
+    \item $d_{\mathrm{dens}}$ be the density number after scaling it into a range the model can use
+    \item $d_{\mathrm{id}}$ be the beatmap-ID number after scaling it, used as a rough style hint
+    \item $\mathbf{c}$ be the 3-number column made by putting those values together
+    \item $\phi(\cdot)$ be the small neural network that turns those 3 numbers into a richer feature
+    \item $\mathbf{g}$ be the output of that small neural network, meaning the final metadata feature the model uses
+    \item $E_{<t}$ be the decoder's token representation before metadata is added
+    \item $\tilde{E}_{<t}$ be the decoder's token representation after metadata is added
+    \item $\alpha$ be a learned number that controls how strongly the metadata affects the decoder
+\end{itemize}
+
+These are normalized, stacked, projected, and added to decoder token states:
+
+\[
+\mathbf{c} = [d_{\mathrm{diff}}, d_{\mathrm{dens}}, d_{\mathrm{id}}]^{\top}
+\]
+
+\[
+\mathbf{g} = \phi(\mathbf{c})
+\]
+
+\[
+\tilde{E}_{<t} = E_{<t} + \alpha \mathbf{g}
+\]
+
+Interpretation of the symbols:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathbf{c} \in \mathbb{R}^{3}$ just means ``a list of 3 real numbers''
+    \item $\mathbf{g}$ is the model's learned summary of the metadata
+    \item the same $\mathbf{g}$ is copied to every decoder step, because the whole chart window shares the same metadata
+    \item $\alpha$ lets the model decide whether metadata should matter a little or a lot
+\end{itemize}
+
+Interpretation:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item difficulty biases chart hardness
+    \item density biases note rate
+    \item beatmap ID acts as a weak style prior for mapper/chart tendencies
+\end{itemize}
+
+\section*{Context Transformer Variation}
+
+The context model keeps the same AR backbone, but changes the decoder input context.
+
+Instead of decoding from only the current window, it prepends:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item recent history tokens
+    \item retrieved motif tokens from earlier similar windows
+    \item current-window tokens
+\end{itemize}
+
+Segment embeddings tell the decoder which tokens come from which source.
+
+This is meant to improve:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item cross-window continuity
+    \item motif recurrence
+    \item phrase-level consistency
+\end{itemize}
+
+\section*{Retrieval Math}
+
+Define the symbols locally:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $H_i$ is the encoder output for an earlier audio window $i$
+    \item $H_{\mathrm{cur}}$ is the encoder output for the current audio window the model is working on now
+    \item $\mathrm{mean}(H_i)$ means ``average all the time-step vectors in window $i$ into one summary vector''
+    \item $\mathbf{k}_i$ is the stored lookup vector for earlier window $i$
+    \item $\mathbf{q}$ is the lookup vector for the current window
+    \item $s_i$ is the similarity score between the current window and earlier window $i$
+    \item $K$ is how many earlier windows we keep after retrieval
+    \item $\mathbf{z}_{\mathrm{hist}}$ is the block of token representations from recent chart history
+    \item $\mathbf{z}_{\mathrm{retr}}$ is the block of token representations copied from retrieved earlier motifs
+    \item $\mathbf{z}_{\mathrm{cur}}$ is the block of token representations for the current part being decoded
+    \item $\mathbf{z}_{\mathrm{ctx}}$ is the full decoder input after joining history, retrieval, and current tokens together
+\end{itemize}
+
+For each prior window, the model computes a pooled audio key from the encoded memory:
+
+\[
+\mathbf{k}_i = \frac{\mathrm{mean}(H_i)}{\lVert \mathrm{mean}(H_i) \rVert_2}
+\]
+
+For the current window:
+
+\[
+\mathbf{q} = \frac{\mathrm{mean}(H_{\mathrm{cur}})}{\lVert \mathrm{mean}(H_{\mathrm{cur}}) \rVert_2}
+\]
+
+Similarity is cosine similarity:
+
+\[
+s_i = \mathbf{q}^{\top} \mathbf{k}_i
+\]
+
+Interpretation of the symbols:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathbf{k}_i$ is the ``saved fingerprint'' for earlier window $i$
+    \item $\mathbf{q}$ is the ``current fingerprint'' used to search for similar earlier windows
+    \item $s_i$ gets larger when the current window and earlier window look more alike
+    \item this is cosine similarity because both vectors are scaled to length 1 before comparison
+\end{itemize}
+
+Then retrieve the top $K$ prior windows with highest $s_i$, excluding the most recent few windows to avoid trivial copying.
+
+The decoder input becomes:
+
+\[
+\mathbf{z}_{\mathrm{ctx}} = [\mathbf{z}_{\mathrm{hist}} ; \mathbf{z}_{\mathrm{retr}} ; \mathbf{z}_{\mathrm{cur}}]
+\]
+
+Here $[\cdot ; \cdot ; \cdot]$ denotes concatenation along the token dimension.
+
+In simpler words, this means the decoder reads:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item some recent chart history
+    \item some retrieved old patterns that match the current music
+    \item the current generation region
+\end{itemize}
+
+all as one long input sequence.
+
+So the context model is effectively using retrieval-augmented sequence modeling over earlier musical structure.
+
+\section*{Key Optimizations}
+
+\subsection*{Data / Training Setup}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item Beat-aligned representation at \texttt{48} frames per beat
+    \begin{itemize}[leftmargin=1.5em]
+        \item This turns raw audio into a rhythm-aware grid, so the model sees music in units that line up with beats instead of arbitrary waveform chunks.
+        \item That makes the token timing task much easier, because note placement is learned relative to beat structure.
+    \end{itemize}
+    \item 4-beat training windows
+    \begin{itemize}[leftmargin=1.5em]
+        \item The repo uses short fixed windows with shape $(192, 128)$.
+        \item This keeps the problem computationally manageable and gives stable fixed-size supervision for the AR model.
+    \end{itemize}
+    \item constant-BPM taiko-only filtering
+    \begin{itemize}[leftmargin=1.5em]
+        \item Charts with BPM changes are removed from the main training/inference path.
+        \item This simplifies beat alignment, timing-token generation, and reconstruction, reducing noise in the training data.
+    \end{itemize}
+    \item optional \texttt{keep\_only\_max\_notes\_per\_song} curation
+    \begin{itemize}[leftmargin=1.5em]
+        \item When multiple charts exist for the same song, this option keeps only the densest chart.
+        \item The idea is to reduce conflicting supervision from many alternate difficulties and focus training on one strong target per song.
+    \end{itemize}
+    \item snapshot datasets for faster iteration
+    \begin{itemize}[leftmargin=1.5em]
+        \item Instead of always training on the full eligible pool, the repo can build a curated snapshot subset.
+        \item This makes experiments cheaper and faster while still using the same preprocessing and model code.
+    \end{itemize}
+\end{itemize}
+
+\subsection*{Runtime / Engineering}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item cached manifests, splits, and sequence indexes
+    \begin{itemize}[leftmargin=1.5em]
+        \item The repo caches chart manifests and train/validation/test sequence indexes.
+        \item This avoids repeating expensive bookkeeping every time a new run starts, which speeds up experimentation and improves reproducibility.
+    \end{itemize}
+    \item mixed precision (\texttt{bf16} / \texttt{fp16} when available)
+    \begin{itemize}[leftmargin=1.5em]
+        \item Training can automatically use lower-precision math on supported hardware.
+        \item This reduces memory use and often increases throughput, allowing larger batches or faster epochs without changing the model design.
+    \end{itemize}
+    \item tuned dataloader settings
+    \begin{itemize}[leftmargin=1.5em]
+        \item Settings such as \texttt{pin\_memory}, worker count, prefetching, and persistent workers are exposed and used in optimized runs.
+        \item These are not model changes, but they matter because slow data loading can bottleneck GPU training.
+    \end{itemize}
+    \item exported inference snapshots during training
+    \begin{itemize}[leftmargin=1.5em]
+        \item The training loop can periodically save inference-ready checkpoints instead of only saving the final model.
+        \item This lets the team test intermediate models directly in the real inference path and compare quality before the end of training.
+    \end{itemize}
+    \item throughput and adherence monitoring
+    \begin{itemize}[leftmargin=1.5em]
+        \item The repo tracks runtime measures such as tokens-per-second as well as proxy adherence metrics such as density error and difficulty drift.
+        \item These diagnostics help evaluate not just whether loss is decreasing, but whether the conditioning behavior is staying aligned with the intended chart properties.
+    \end{itemize}
+\end{itemize}
+
+\subsection*{Why These Optimizations Matter}
+
+These optimizations matter because the project is not only about designing a model, but also about making the full training-and-inference workflow practical.
+
+\begin{itemize}[leftmargin=1.5em]
+    \item Data filtering reduces label noise and keeps the task well-defined.
+    \item Windowing and beat alignment make the learning problem simpler.
+    \item Snapshot datasets and maxopt curation make experiments faster and more controlled.
+    \item Mixed precision and dataloader tuning improve hardware efficiency.
+    \item Cached indexes and inference snapshots reduce iteration cost.
+\end{itemize}
+
+So the optimization story is: simplify the learning problem, clean the supervision, and make iteration fast enough that many model variants can actually be tested.
+
+\section*{One-Line Takeaway}
+
+The baseline model is an audio-to-token autoregressive transformer, and the main extension is a context-and-retrieval mechanism that helps the model reuse earlier musical/chart patterns while keeping training and deployment practical through strong data and runtime optimizations.
+
+\end{document}
